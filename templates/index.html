@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Analyzer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* ── Shader canvas background ───────────────────────────────────────── */
+    #shader-canvas {
+      position: fixed; inset: 0; width: 100%; height: 100%;
+      z-index: 0; display: block;
+    }
+
+    /* ── All content sits above the canvas ─────────────────────────────── */
+    header, main { position: relative; z-index: 10; }
+
+    /* ── Glass morphism cards ───────────────────────────────────────────── */
+    .glass {
+      background: rgba(255,255,255,0.08);
+      backdrop-filter: blur(18px) saturate(160%);
+      -webkit-backdrop-filter: blur(18px) saturate(160%);
+      border: 1px solid rgba(255,255,255,0.18);
+    }
+    .glass-white {
+      background: rgba(255,255,255,0.92);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(255,255,255,0.4);
+    }
+
+    /* ── Tab styles ─────────────────────────────────────────────────────── */
+    .tab-btn.active {
+      background: white; color: #1e3a8a; font-weight: 700;
+      border-bottom: 2px solid #2563eb;
+    }
+    .tab-btn { color: #6b7280; }
+    .tab-btn:hover:not(.active) { background: #f3f4f6; color: #374151; }
+
+    /* ── Table ──────────────────────────────────────────────────────────── */
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th { background: #1e3a8a; color: white; padding: 8px 12px;
+         text-align: left; font-weight: 600; white-space: nowrap; }
+    td { padding: 6px 12px; border-bottom: 1px solid #e5e7eb; color: #111827;
+         max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    tr:nth-child(even) td { background: #f9fafb; }
+    tr:hover td { background: #eff6ff; }
+    td.sev-high { background: #fee2e2 !important; }
+    td.sev-med  { background: #fef9c3 !important; }
+
+    /* ── Drag-and-drop ──────────────────────────────────────────────────── */
+    .drop-active { border-color: #60a5fa !important; background: rgba(96,165,250,0.08) !important; }
+
+    /* ── Spinner ────────────────────────────────────────────────────────── */
+    .spinner { border: 3px solid rgba(255,255,255,0.2); border-top-color: #60a5fa;
+               border-radius: 50%; width: 36px; height: 36px;
+               animation: spin 0.75s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body class="min-h-screen font-sans overflow-x-hidden" style="background:#060d1a;">
+
+<!-- ── Shader canvas (WebGL background) ─────────────────────────────────── -->
+<canvas id="shader-canvas"></canvas>
+
+<!-- ── Header ────────────────────────────────────────────────────────────── -->
+<header class="glass border-b border-white/10 shadow-lg">
+  <div class="max-w-7xl mx-auto px-6 py-4 flex items-center gap-4">
+    <div>
+      <h1 class="text-2xl font-bold tracking-tight text-white">Data Analyzer</h1>
+      <p class="text-blue-200 text-sm mt-0.5">
+        Extract entities · concepts · variables · relationships from any document
+      </p>
+    </div>
+    <div class="ml-auto flex items-center gap-3">
+      <span class="bg-green-600/80 text-white text-xs font-semibold px-3 py-1 rounded-full">
+        Device Only
+      </span>
+      <span class="text-blue-300 text-xs">{{ nlp_model }} + KeyBERT</span>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto px-6 py-6 space-y-6">
+
+  <!-- ── Upload card ───────────────────────────────────────────────────────── -->
+  <section class="glass-white rounded-xl shadow-xl p-6">
+    <h2 class="text-base font-semibold text-gray-800 mb-4">Documents</h2>
+
+    <!-- Drop zone -->
+    <div id="drop-zone"
+         class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center
+                cursor-pointer transition-colors duration-150 mb-4"
+         onclick="document.getElementById('file-input').click()">
+      <svg class="mx-auto mb-2 text-gray-400 w-10 h-10" fill="none" stroke="currentColor"
+           viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0
+                 0l-3 3m3-3v12"/>
+      </svg>
+      <p class="text-gray-500 text-sm">Drop files here or
+        <span class="text-blue-600 font-medium">browse</span></p>
+      <p class="text-gray-400 text-xs mt-1">PDF, Word (.docx), TXT, ASC, MD, CSV</p>
+      <input id="file-input" type="file" class="hidden" multiple
+             accept=".pdf,.docx,.doc,.txt,.text,.asc,.ascii,.log,.md,.csv"
+             onchange="addFiles(this.files)" />
+    </div>
+
+    <ul id="file-list" class="space-y-1 mb-4 max-h-40 overflow-y-auto"></ul>
+
+    <div class="flex items-center gap-3 flex-wrap">
+      <button onclick="document.getElementById('file-input').click()"
+              class="px-4 py-2 bg-white border border-gray-300 text-gray-700 text-sm
+                     font-medium rounded-lg hover:bg-gray-50 transition">Browse…</button>
+      <button onclick="clearFiles()"
+              class="px-4 py-2 bg-white border border-gray-300 text-gray-500 text-sm
+                     font-medium rounded-lg hover:bg-gray-50 transition">Clear All</button>
+      <div class="ml-auto">
+        <button id="btn-analyze" onclick="runAnalysis()"
+                class="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold
+                       text-sm rounded-lg shadow transition disabled:opacity-50
+                       disabled:cursor-not-allowed">▶ &nbsp;Analyze</button>
+      </div>
+    </div>
+
+    <div id="progress-area" class="hidden mt-4">
+      <div class="flex items-center gap-3">
+        <div class="spinner"></div>
+        <span id="progress-msg" class="text-sm text-gray-600">Analyzing…</span>
+      </div>
+      <div class="w-full bg-gray-100 rounded-full h-2 mt-3">
+        <div id="progress-bar"
+             class="bg-blue-600 h-2 rounded-full transition-all duration-300"
+             style="width:0%"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Results ───────────────────────────────────────────────────────────── -->
+  <section id="results-section" class="hidden">
+
+    <div id="summary-cards"
+         class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 mb-6"></div>
+
+    <div class="glass-white rounded-xl shadow-xl overflow-hidden">
+      <div class="flex border-b border-gray-200 overflow-x-auto" id="tab-bar">
+        <button class="tab-btn active px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('files',this)">Files</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('entities',this)">Entities</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('concepts',this)">Key Concepts</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('variables',this)">Variables</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('relationships',this)">Relationships</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('problems',this)">Problems</button>
+      </div>
+      <div class="overflow-auto max-h-[420px]" id="table-area">
+        <p class="text-gray-400 text-center py-12 text-sm">Run analysis to see results.</p>
+      </div>
+    </div>
+
+    <div class="glass-white rounded-xl shadow-xl p-4 flex items-center gap-3 flex-wrap mt-4">
+      <span class="text-sm font-semibold text-gray-700">Export:</span>
+      <button onclick="doExport('xlsx')"
+              class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white text-sm
+                     font-semibold rounded-lg transition shadow-sm">Excel (.xlsx)</button>
+      <button onclick="doExport('csv')"
+              class="px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white text-sm
+                     font-semibold rounded-lg transition shadow-sm">CSV (.zip)</button>
+      <button onclick="doExport('md')"
+              class="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-sm
+                     font-semibold rounded-lg transition shadow-sm">Markdown (.md)</button>
+    </div>
+  </section>
+
+</main>
+
+<!-- ── Toast ──────────────────────────────────────────────────────────────── -->
+<div id="toast"
+     class="fixed bottom-6 right-6 text-white text-sm px-5 py-3 rounded-xl shadow-xl
+            opacity-0 transition-opacity duration-300 pointer-events-none z-50"
+     style="background:rgba(22,101,52,0.95);"></div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     WebGL Shader Background  (ported from animated-shader-hero)
+═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+(function () {
+  const canvas = document.getElementById('shader-canvas');
+  const gl = canvas.getContext('webgl2');
+  if (!gl) return;            // graceful fallback — page still usable
+
+  /* ── Shaders ─────────────────────────────────────────────────────────── */
+  const VS = `#version 300 es
+precision highp float;
+in vec4 position;
+void main(){ gl_Position = position; }`;
+
+  const FS = `#version 300 es
+precision highp float;
+
+uniform float  uTime;
+uniform vec2   uResolution;
+uniform vec2   uMouse;       // 0..1 normalised
+uniform vec2   uMouseDelta;
+
+out vec4 fragColor;
+
+/* ── Hash / noise helpers ─────────────────────────────────────────────── */
+float hash(vec2 p){
+  return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123);
+}
+float noise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  f = f*f*(3.0-2.0*f);
+  return mix(mix(hash(i),           hash(i+vec2(1,0)), f.x),
+             mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+}
+float fbm(vec2 p){
+  float v=0.0, a=0.5;
+  for(int i=0;i<6;i++){ v+=a*noise(p); p=p*2.1+vec2(1.3,1.7); a*=0.5; }
+  return v;
+}
+
+/* ── Main ─────────────────────────────────────────────────────────────── */
+void main(){
+  vec2 uv = gl_FragCoord.xy / uResolution;
+  float t  = uTime * 0.18;
+
+  /* Warped FBM layers (fluid look) */
+  vec2 q = vec2(fbm(uv*1.8 + t*vec2(0.12, 0.14)),
+                fbm(uv*1.8 + t*vec2(0.15, 0.10)));
+  vec2 r = vec2(fbm(uv*1.4 + q + vec2(1.7, 9.2) + 0.14*t),
+                fbm(uv*1.4 + q + vec2(8.3, 2.8) + 0.12*t));
+  float f = fbm(uv + r*1.1);
+
+  /* Mouse glow */
+  float mDist = length(uv - uMouse);
+  float mGlow = 0.18 / (mDist*4.0 + 0.25);
+
+  /* Speed streak from mouse movement */
+  float speed = length(uMouseDelta) * 8.0;
+
+  /* Palette: deep navy → electric blue → cyan accent */
+  vec3 dark   = vec3(0.01, 0.04, 0.14);
+  vec3 mid    = vec3(0.05, 0.18, 0.55);
+  vec3 bright = vec3(0.18, 0.55, 0.95);
+  vec3 accent = vec3(0.25, 0.85, 0.98);
+
+  float blend = clamp(f*f*3.5, 0.0, 1.0);
+  vec3  col   = mix(dark, mid,    blend);
+  col = mix(col, bright, clamp(length(q)*0.7, 0.0, 1.0));
+  col = mix(col, accent, clamp(r.x*0.4,       0.0, 1.0));
+
+  /* Mouse influence */
+  col += accent * mGlow * 0.55;
+  col += bright * speed * 0.04;
+
+  /* Subtle vignette */
+  vec2 vig = uv*2.0 - 1.0;
+  float v  = 1.0 - dot(vig, vig)*0.25;
+  col *= clamp(v, 0.0, 1.0);
+
+  fragColor = vec4(col, 1.0);
+}`;
+
+  /* ── Compile helpers ──────────────────────────────────────────────────── */
+  function compileShader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      console.error('Shader error:', gl.getShaderInfoLog(s));
+    return s;
+  }
+
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compileShader(gl.VERTEX_SHADER,   VS));
+  gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+
+  /* ── Geometry (full-screen quad) ──────────────────────────────────────── */
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER,
+    new Float32Array([-1,1, -1,-1, 1,1, 1,-1]), gl.STATIC_DRAW);
+  const posLoc = gl.getAttribLocation(prog, 'position');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+  /* ── Uniform locations ────────────────────────────────────────────────── */
+  const uTime       = gl.getUniformLocation(prog, 'uTime');
+  const uResolution = gl.getUniformLocation(prog, 'uResolution');
+  const uMouse      = gl.getUniformLocation(prog, 'uMouse');
+  const uMouseDelta = gl.getUniformLocation(prog, 'uMouseDelta');
+
+  /* ── Resize handler ───────────────────────────────────────────────────── */
+  function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* ── Mouse tracking ───────────────────────────────────────────────────── */
+  let mx = 0.5, my = 0.5, dmx = 0, dmy = 0;
+  window.addEventListener('mousemove', e => {
+    const nx = e.clientX / window.innerWidth;
+    const ny = 1.0 - e.clientY / window.innerHeight;
+    dmx = nx - mx; dmy = ny - my;
+    mx = nx; my = ny;
+  });
+  window.addEventListener('touchmove', e => {
+    const t = e.touches[0];
+    const nx = t.clientX / window.innerWidth;
+    const ny = 1.0 - t.clientY / window.innerHeight;
+    dmx = nx - mx; dmy = ny - my;
+    mx = nx; my = ny;
+  }, { passive: true });
+
+  /* ── Render loop ──────────────────────────────────────────────────────── */
+  const start = performance.now();
+  (function loop() {
+    const t = (performance.now() - start) / 1000;
+    gl.uniform1f(uTime,       t);
+    gl.uniform2f(uResolution, canvas.width, canvas.height);
+    gl.uniform2f(uMouse,      mx, my);
+    gl.uniform2f(uMouseDelta, dmx, dmy);
+    dmx *= 0.85; dmy *= 0.85;   // decay delta
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    requestAnimationFrame(loop);
+  })();
+})();
+</script>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     App Logic
+═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+let files   = [];
+let sid     = null;
+let results = null;
+let activeTab = 'files';
+
+/* ── File handling ──────────────────────────────────────────────────────── */
+function addFiles(fileList) {
+  const existing = new Set(files.map(f => f.name));
+  for (const f of fileList) {
+    if (!existing.has(f.name)) { files.push(f); existing.add(f.name); }
+  }
+  renderFileList();
+}
+function renderFileList() {
+  const ul = document.getElementById('file-list');
+  ul.innerHTML = '';
+  files.forEach((f, i) => {
+    const li = document.createElement('li');
+    li.className = 'flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2 text-sm';
+    li.innerHTML = `
+      <span class="text-gray-700 truncate max-w-xs">${f.name}</span>
+      <span class="text-gray-400 text-xs ml-2 shrink-0">${(f.size/1024).toFixed(0)} KB</span>
+      <button onclick="removeFile(${i})"
+              class="ml-3 text-gray-400 hover:text-red-500 transition font-bold shrink-0">✕</button>`;
+    ul.appendChild(li);
+  });
+}
+function removeFile(i) { files.splice(i, 1); renderFileList(); }
+function clearFiles()  { files = []; renderFileList(); }
+
+/* ── Drag & drop ────────────────────────────────────────────────────────── */
+const dz = document.getElementById('drop-zone');
+dz.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('drop-active'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drop-active'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('drop-active'); addFiles(e.dataTransfer.files);
+});
+
+/* ── Analysis ───────────────────────────────────────────────────────────── */
+async function runAnalysis() {
+  if (files.length === 0) { toast('Add at least one file first.', 'warn'); return; }
+  const btn = document.getElementById('btn-analyze');
+  btn.disabled = true;
+  showProgress(true, 'Uploading files…', 10);
+  const fd = new FormData();
+  files.forEach(f => fd.append('files', f));
+  try {
+    showProgress(true, 'Analyzing document(s)…', 35);
+    const resp = await fetch('/analyze', { method: 'POST', body: fd });
+    showProgress(true, 'Processing results…', 80);
+    const data = await resp.json();
+    if (!resp.ok) { toast(data.error || 'Analysis failed.', 'error'); return; }
+    sid     = data.session_id;
+    results = data.results;
+    showProgress(true, 'Done.', 100);
+    setTimeout(() => {
+      showProgress(false);
+      renderResults();
+      document.getElementById('results-section').classList.remove('hidden');
+      document.getElementById('results-section').scrollIntoView({ behavior: 'smooth' });
+      toast('Analysis complete!', 'ok');
+    }, 400);
+  } catch (err) {
+    toast('Network error: ' + err.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+function showProgress(visible, msg = '', pct = 0) {
+  document.getElementById('progress-area').classList.toggle('hidden', !visible);
+  document.getElementById('progress-msg').textContent  = msg;
+  document.getElementById('progress-bar').style.width  = pct + '%';
+}
+
+/* ── Render results ─────────────────────────────────────────────────────── */
+function renderResults() {
+  renderSummaryCards(results.summary);
+  showTab(activeTab, document.querySelector('.tab-btn.active'));
+}
+function renderSummaryCards(summary) {
+  const c = document.getElementById('summary-cards');
+  c.innerHTML = '';
+  for (const [k, v] of Object.entries(summary)) {
+    const card = document.createElement('div');
+    card.className = 'glass-white rounded-xl p-4 shadow-sm';
+    card.innerHTML = `
+      <div class="text-2xl font-bold text-[#1e3a8a]">${v}</div>
+      <div class="text-xs text-gray-500 font-semibold mt-1 uppercase tracking-wide">${k}</div>`;
+    c.appendChild(card);
+  }
+}
+function showTab(name, btnEl) {
+  activeTab = name;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  if (btnEl) btnEl.classList.add('active');
+  if (!results) return;
+  const data = results[name];
+  const area = document.getElementById('table-area');
+  if (!data || data.length === 0) {
+    area.innerHTML = '<p class="text-gray-400 text-center py-12 text-sm">No data found.</p>';
+    return;
+  }
+  const cols = Object.keys(data[0]);
+  let html = '<table><thead><tr>';
+  cols.forEach(c => { html += `<th>${esc(c)}</th>`; });
+  html += '</tr></thead><tbody>';
+  data.forEach(row => {
+    const sev = (row.Severity || '').toLowerCase();
+    html += '<tr>';
+    cols.forEach(c => {
+      const cls = c === 'Severity' ? (sev === 'high' ? 'sev-high' : sev === 'medium' ? 'sev-med' : '') : '';
+      html += `<td class="${cls}" title="${esc(String(row[c]??''))}">${esc(String(row[c]??''))}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  area.innerHTML = html;
+}
+
+/* ── Export ─────────────────────────────────────────────────────────────── */
+function doExport(fmt) {
+  if (!sid) { toast('Run analysis first.', 'warn'); return; }
+  const labels = { xlsx:'Excel', csv:'CSV zip', md:'Markdown' };
+  if (!confirm(`Save as ${labels[fmt]}?`)) return;
+  window.location.href = `/export/${sid}/${fmt}`;
+}
+
+/* ── Utilities ──────────────────────────────────────────────────────────── */
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function toast(msg, type = 'ok') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = type === 'error' ? 'rgba(153,27,27,0.95)'
+                      : type === 'warn'  ? 'rgba(146,64,14,0.95)'
+                      : 'rgba(22,101,52,0.95)';
+  t.style.opacity = '1';
+  setTimeout(() => { t.style.opacity = '0'; }, 3000);
+}
+</script>
+</body>
+</html>
