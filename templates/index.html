@@ -46,6 +46,7 @@
          max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     tr:nth-child(even) td { background: #f9fafb; }
     tr:hover td { background: #eff6ff; }
+    td.sev-crit { background: #fecaca !important; color: #7f1d1d; font-weight: 600; }
     td.sev-high { background: #fee2e2 !important; }
     td.sev-med  { background: #fef9c3 !important; }
 
@@ -157,6 +158,16 @@
                 onclick="showTab('relationships',this)">Relationships</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
                 onclick="showTab('problems',this)">Problems</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('dependencies',this)">Dependencies</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('causal_chains',this)">Causal Chains</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('contradictions',this)">Contradictions</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('assumptions',this)">Assumptions</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('insights',this)">Insights</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
                 onclick="showTab('graph',this)">Knowledge Graph</button>
       </div>
@@ -460,7 +471,7 @@ function showTab(name, btnEl) {
     const sev = (row.Severity || '').toLowerCase();
     html += '<tr>';
     cols.forEach(c => {
-      const cls = c === 'Severity' ? (sev === 'high' ? 'sev-high' : sev === 'medium' ? 'sev-med' : '') : '';
+      const cls = c === 'Severity' ? (sev === 'critical' ? 'sev-crit' : sev === 'high' ? 'sev-high' : sev === 'medium' ? 'sev-med' : '') : '';
       html += `<td class="${cls}" title="${esc(String(row[c]??''))}">${esc(String(row[c]??''))}</td>`;
     });
     html += '</tr>';

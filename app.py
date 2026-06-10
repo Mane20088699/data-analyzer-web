@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Data Analyzer — Web Edition  (Flask + Tailwind CSS, localhost)"""
+"""Data Analyzer — Web Edition  (Flask + Tailwind CSS, localhost)
+
+Concept discovery is powered by KeyBERT (all-MiniLM-L6-v2). Everything else in
+this file is a *local reasoning layer* built around KeyBERT and spaCy — no
+external APIs, no agents: preprocessing, candidate re-ranking, synonym merging,
+clustering, dependency / causal / contradiction / assumption analysis, an
+enriched knowledge graph and an executive-insight roll-up. Fully offline and
+deterministic.
+"""
 
 # ── SSL bypass ────────────────────────────────────────────────────────────────
 import ssl as _ssl
@@ -20,9 +28,9 @@ def _patched_req(self, *a, **kw): kw.setdefault("verify", False); return _orig_r
 _req.Session.request = _patched_req
 
 # ── Standard imports ──────────────────────────────────────────────────────────
-import os, re, sys, json, uuid, warnings, tempfile, zipfile, io
+import os, re, sys, json, uuid, random, warnings, tempfile, zipfile, io
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Optional
 warnings.filterwarnings("ignore")
 
@@ -34,11 +42,17 @@ import pdfplumber
 import spacy
 from docx import Document as DocxDocument
 from keybert import KeyBERT
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import AgglomerativeClustering
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from flask import Flask, request, jsonify, send_file, render_template, Response
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+# Determinism: pin the few seeds anything stochastic might read.
+random.seed(0)
+np.random.seed(0)
 
 # ── NLTK bootstrap ────────────────────────────────────────────────────────────
 for _r in ["punkt", "punkt_tab", "stopwords"]:
@@ -74,6 +88,52 @@ PROBLEM_WORDS = {
     "risk","hazard","unsafe","vulnerable","vulnerability","violation",
     "breach","invalid","incorrect","wrong","timeout","blocked","frozen",
     "deprecated","obsolete","flaw","weakness",
+}
+
+# Subset of PROBLEM_WORDS that escalate a finding to Critical severity.
+SECURITY_WORDS = {
+    "vulnerability","vulnerable","breach","exploit","unsafe","hazard","leak",
+    "deadlock","overflow","unauthorized","malware","attack","compromise","violation",
+}
+
+# Relationship phrases that express a dependency (for the dependency map).
+DEP_REL_WORDS = {
+    "depends on","depend","requires","require","needs","need","uses","use",
+    "based on","relies on","rely","part of","composed of","contains","contain",
+    "include","includes","built on","powered by","derived from",
+}
+
+# Opposing predicate pairs → flag contradictory relationships on the same pair.
+ANTONYM_PAIRS = [
+    ("increase","decrease"),("increases","decreases"),("enable","prevent"),
+    ("enables","prevents"),("allow","block"),("allows","blocks"),
+    ("cause","prevent"),("causes","prevents"),("support","contradict"),
+    ("supports","contradicts"),("improve","reduce"),("improves","reduces"),
+    ("add","remove"),("adds","removes"),("open","close"),("opens","closes"),
+    ("accept","reject"),("accepts","rejects"),("start","stop"),("rise","fall"),
+]
+
+# Assumption markers → confidence that the sentence states a (possibly hidden) premise.
+ASSUMPTION_MARKERS = {
+    "it is assumed": 85, "we assume": 85, "taken for granted": 82, "assumption": 80,
+    "assuming": 80, "presume": 78, "assume": 78, "presumably": 70, "supposedly": 68,
+    "by default": 65, "given that": 60, "we believe": 60, "suppose": 60,
+    "in theory": 58, "expected to": 55, "should be": 50,
+}
+
+_NEGATIONS = {
+    "not","no","never","cannot","can't","won't","doesn't","don't","isn't",
+    "aren't","wasn't","weren't","without","unable","none","neither","nor",
+}
+
+# Per-pattern confidence for causal/relational regexes (explicit causality > weak association).
+_CAUSAL_CONF = {
+    "causes": 88, "caused by": 86, "leads to": 85, "results in": 85, "due to": 84,
+    "triggers": 82, "depends on": 80, "requires": 80, "prevents": 80, "enables": 78,
+    "blocks": 78, "if → then": 75, "impacts": 70, "affects": 70, "demands": 66,
+    "extracts": 60, "associated with": 60, "reveals": 58, "shows": 56, "shares": 55,
+    "reflects": 55, "faces": 55, "recognizes": 55, "represents": 54, "carries": 52,
+    "symbolizes": 50, "explores": 50, "enters": 50, "reclaims": 50, "escapes": 50,
 }
 
 CAUSAL_PATTERNS: List[Tuple[str, str]] = [
@@ -120,6 +180,22 @@ VARIABLE_PATTERNS: List[Tuple[str, str]] = [
     (r"\b([\d.]+)\s*(percent|%|degrees?|ms|milliseconds?|seconds?|minutes?"
      r"|hours?|days?|meters?|km|kg|lb|MB|GB|TB|KB|RPM|fps|Hz|kHz|MHz|V|A|W)\b", "measurement"),
 ]
+
+_SVO_DEPS = {"ROOT", "relcl", "xcomp", "advcl", "conj", "acl", "ccomp", "pcomp"}
+
+_PERSON_PREFIXES = re.compile(
+    r"^(O'|O’|Mc|Mac|De|Di|Van|Von|Le|La|St\.?\s)\w", re.IGNORECASE)
+
+_TRIVIAL_CONCEPTS = {
+    "one","two","three","four","five","six","seven","eight","nine","ten",
+    "first","second","third","fourth","fifth","last","next","new","old",
+    "good","great","well","also","even","just","like","much","many","every",
+    "said","say","told","tell","got","get","know","think","want","need",
+    "go","come","see","look","take","give","make","use","find","turn",
+    "day","time","man","woman","people","way","thing","place","part","year",
+    "yes","no","not","yet","still","back","away","down","up","out","over",
+    "never","always","already","once","again","around","together",
+}
 
 # ── Document readers ──────────────────────────────────────────────────────────
 def read_pdf(path: str) -> str:
@@ -170,51 +246,293 @@ def chunk_text(text: str, max_chunk: int = 80_000) -> List[str]:
 def _clean(text: str, n: int = 200) -> str:
     return re.sub(r"\s+", " ", text).strip()[:n]
 
-# ── Extractors ────────────────────────────────────────────────────────────────
-_PERSON_PREFIXES = re.compile(
-    r"^(O'|O’|Mc|Mac|De|Di|Van|Von|Le|La|St\.?\s)\w", re.IGNORECASE)
-_TRIVIAL_CONCEPTS = {
-    "one","two","three","four","five","six","seven","eight","nine","ten",
-    "first","second","third","fourth","fifth","last","next","new","old",
-    "good","great","well","also","even","just","like","much","many","every",
-    "said","say","told","tell","got","get","know","think","want","need",
-    "go","come","see","look","take","give","make","use","find","turn",
-    "day","time","man","woman","people","way","thing","place","part","year",
-    "yes","no","not","yet","still","back","away","down","up","out","over",
-    "never","always","already","once","again","around","together",
-}
+_LEADING_FLUFF = re.compile(
+    r"^(?:the|a|an|and|but|or|nor|so|then|thus|hence|therefore|however|this|that|"
+    r"these|those|its|their|our|your|his|her|which|who|it|they)\s+", re.IGNORECASE)
 
-def extract_entities(text: str) -> List[Dict]:
-    counter: Counter = Counter()
-    for chunk in chunk_text(text):
-        doc = NLP(chunk)
-        for ent in doc.ents:
-            t = ent.text.strip()
-            label = ent.label_
-            if len(t) <= 1: continue
-            if label == "GPE" and (_PERSON_PREFIXES.match(t) or "'" in t):
-                label = "PERSON"
-            counter[(t, label)] += 1
-    return [{"Entity": t, "Type": l, "Description": spacy.explain(l) or l, "Occurrences": c}
-            for (t, l), c in sorted(counter.items(), key=lambda x: -x[1])]
+def _node_label(text: str, n: int = 40) -> str:
+    """Canonical graph-node label: trimmed + leading articles/conjunctions stripped.
 
-def extract_concepts(text: str, top_n: int = 30) -> List[Dict]:
+    Collapses fragments like 'and the Database' / 'The Database' into 'Database'
+    so causal chains, dependencies and problems don't fragment on surface form."""
+    s = _clean(text, n)
+    prev = None
+    while prev != s:
+        prev = s
+        s = _LEADING_FLUFF.sub("", s).strip()
+    return s
+
+def _embed(texts: List[str]) -> np.ndarray:
+    """Embed phrases with KeyBERT's own sentence-transformer — no extra model."""
+    if not texts:
+        return np.zeros((0, 384), dtype="float32")
+    return np.asarray(KW_MODEL.model.embed(texts))
+
+def _cluster(emb: np.ndarray, threshold: float = 0.55) -> List[int]:
+    """Deterministic agglomerative clustering by cosine distance."""
+    n = len(emb)
+    if n <= 2:
+        return [0] * n
     try:
-        kws = KW_MODEL.extract_keywords(text[:60_000], keyphrase_ngram_range=(1, 3),
-                                         stop_words="english", top_n=top_n,
-                                         use_mmr=True, diversity=0.5)
-        results = []
-        for kw, sc in kws:
+        model = AgglomerativeClustering(
+            n_clusters=None, metric="cosine", linkage="average",
+            distance_threshold=threshold)
+        return list(model.fit_predict(emb))
+    except Exception:
+        return [0] * n
+
+_HEADING_RE = re.compile(r"^(?:\d+(?:\.\d+)*[.)]?\s+)?[A-Z][^.!?]{2,68}$")
+
+def _headings(text: str) -> List[str]:
+    """Heuristic heading lines (short, Title/UPPER case, no terminal period)."""
+    out = []
+    for line in text.splitlines():
+        l = line.strip()
+        if 3 <= len(l) <= 70 and len(l.split()) <= 10 and \
+           (l.isupper() or _HEADING_RE.match(l)):
+            out.append(l.lower())
+    return out
+
+def _tail_windows(text: str, head: int = 60_000, size: int = 20_000,
+                  max_windows: int = 4) -> List[str]:
+    """Sliding windows over the part of long docs KeyBERT's head pass misses."""
+    if len(text) <= head:
+        return []
+    seg = text[head:head + size * max_windows]
+    return [seg[i:i + size] for i in range(0, len(seg), size)]
+
+def preprocess_text(text: str) -> str:
+    """Normalise text before it reaches KeyBERT/spaCy (the 'preprocessing' layer)."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"-\n(?=[a-z])", "", text)                 # de-hyphenate wraps
+    lines = [l.rstrip() for l in text.split("\n")]
+    # Drop repeated page headers/footers (same short line appearing many times).
+    freq = Counter(l.strip() for l in lines if 0 < len(l.strip()) <= 60)
+    boiler = {l for l, c in freq.items()
+              if c >= 5 and not l.endswith((".", ":", "?", "!"))}
+    if boiler:
+        lines = [l for l in lines if l.strip() not in boiler]
+    text = "\n".join(lines)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+# ── Core spaCy pass: sentences + entities + SVO in one sweep ────────────────────
+def parse_document(text: str):
+    """One spaCy pass → (sentences, entity counter, entity→sentence map, SVO triples)."""
+    sents: List[str] = []
+    ent_counter: Counter = Counter()
+    ent_sents: Dict[str, set] = defaultdict(set)
+    svo: List[Dict] = []
+
+    for chunk in chunk_text(text, 40_000):
+        doc = NLP(chunk)
+        for sent in doc.sents:
+            stext = _clean(sent.text, 100_000)
+            if not stext:
+                continue
+            si = len(sents)
+            sents.append(stext)
+
+            for ent in sent.ents:
+                t = ent.text.strip(); label = ent.label_
+                if len(t) <= 1: continue
+                if label == "GPE" and (_PERSON_PREFIXES.match(t) or "'" in t):
+                    label = "PERSON"
+                ent_counter[(t, label)] += 1
+                ent_sents[t.lower()].add(si)
+
+            for tok in sent:
+                if tok.pos_ != "VERB" or tok.dep_ not in _SVO_DEPS: continue
+                verb = tok.lemma_.lower()
+                subjs = [w for w in tok.lefts  if w.dep_ in ("nsubj","nsubjpass","csubj")]
+                objs  = [w for w in tok.rights if w.dep_ in ("dobj","attr","acomp")]
+                for prep in tok.rights:
+                    if prep.dep_ == "prep":
+                        objs += [c for c in prep.children if c.dep_ == "pobj"]
+                for s in subjs:
+                    st = _clean(" ".join(w.text for w in s.subtree
+                                         if w.dep_ not in ("det","punct") and len(w.text) > 1))
+                    for o in objs:
+                        ot = _clean(" ".join(w.text for w in o.subtree
+                                             if w.dep_ not in ("det","punct") and len(w.text) > 1))
+                        if st and ot and len(st) > 2:
+                            svo.append({"Subject": st, "Relationship": verb, "Object": ot,
+                                        "Rel. Type": "syntactic (SVO)", "Confidence": 65,
+                                        "Source Sentence": _clean(sent.text, 250), "_si": si})
+
+    seen, dedup = set(), []
+    for r in svo:
+        key = (r["Subject"].lower()[:40], r["Relationship"][:20], r["Object"].lower()[:40])
+        if key not in seen:
+            seen.add(key); dedup.append(r)
+    return sents, ent_counter, ent_sents, dedup[:300]
+
+# ── Concept extraction: KeyBERT engine + reasoning layer ────────────────────────
+def extract_concepts(text: str, sents: List[str], ent_sents: Dict[str, set]) -> List[Dict]:
+    """KeyBERT discovers candidates; the surrounding layer filters, merges,
+    re-ranks, clusters, describes and links them. KeyBERT stays the engine."""
+    try:
+        # 1 ── candidate discovery (KeyBERT): head pass + sliding tail windows
+        cand: Dict[str, float] = {}
+        def _harvest(segment: str, weight: float, n: int):
+            segment = segment.strip()
+            if len(segment) < 40:
+                return
+            for kw, sc in KW_MODEL.extract_keywords(
+                    segment, keyphrase_ngram_range=(1, 3), stop_words="english",
+                    top_n=n, use_mmr=True, diversity=0.5):
+                cand[kw] = max(cand.get(kw, 0.0), sc * weight)
+
+        _harvest(text[:60_000], 1.0, 40)
+        for w in _tail_windows(text):
+            _harvest(w, 0.85, 10)
+
+        # 2 ── filter trivial / numeric / too-short candidates
+        cands: List[Tuple[str, float]] = []
+        for kw, sc in cand.items():
             words = kw.lower().split()
             if len(words) == 1 and words[0] in _TRIVIAL_CONCEPTS: continue
             if re.fullmatch(r'[\d\s,.\-]+', kw): continue
             if len(words) == 1 and len(kw) <= 2: continue
-            results.append({"Concept": kw, "Relevance Score": round(sc, 4)})
-            if len(results) >= 25: break
-        return results
-    except Exception as exc:
-        return [{"Concept": f"Error: {exc}", "Relevance Score": 0.0}]
+            if all(w in STOPWORDS for w in words): continue
+            cands.append((kw, sc))
+        if not cands:
+            return []
 
+        phrases = [k for k, _ in cands]
+        emb = _embed(phrases)
+
+        # 3 ── merge near-duplicate / synonymous phrases (cosine ≥ 0.82 or substring)
+        sim = cosine_similarity(emb) if len(phrases) > 1 else np.array([[1.0]])
+        order = sorted(range(len(phrases)), key=lambda i: -cands[i][1])
+        merged_into: Dict[int, int] = {}
+        for pos, i in enumerate(order):
+            if i in merged_into: continue
+            for j in order[pos + 1:]:
+                if j in merged_into: continue
+                a, b = phrases[i].lower(), phrases[j].lower()
+                if sim[i][j] >= 0.82 or a == b or a in b or b in a:
+                    merged_into[j] = i
+        keep = [i for i in range(len(phrases)) if i not in merged_into]
+
+        # 4 ── multi-signal feature scoring → 0..100 importance
+        low = text.lower()
+        heads = " || ".join(_headings(text))
+        sents_low = [s.lower() for s in sents]
+        kb_scores = [cands[i][1] for i in keep]
+        kb_min, kb_max = min(kb_scores), max(kb_scores)
+
+        rows: List[Dict] = []
+        for i in keep:
+            kw = phrases[i]; klow = kw.lower()
+            kb = cands[i][1]
+            kb_n = (kb - kb_min) / (kb_max - kb_min) if kb_max > kb_min else 1.0
+            freq = low.count(klow)
+            freq_n = min(np.log1p(freq) / np.log1p(20), 1.0)
+            pos = low.find(klow)
+            pos_n = 1.0 - (pos / len(low)) if pos >= 0 and low else 0.0
+            head_n = 1.0 if klow and klow in heads else 0.0
+            csents = {si for si, s in enumerate(sents_low) if klow in s}
+            ent_hits = [(ename, len(csents & eset))
+                        for ename, eset in ent_sents.items()
+                        if len(ename) > 2 and (csents & eset)]
+            ent_n = min(len(ent_hits) / 5.0, 1.0)
+            importance = 100 * (0.42*kb_n + 0.24*freq_n + 0.14*pos_n +
+                                0.10*head_n + 0.10*ent_n)
+            rel_ents = [e for e, _ in sorted(ent_hits, key=lambda x: -x[1])[:3]]
+            desc = ""
+            for si in sorted(csents):
+                if 30 <= len(sents[si]) <= 240:
+                    desc = sents[si]; break
+            if not desc and csents:
+                desc = sents[min(csents)]
+            rows.append({"_i": i, "Concept": kw, "kb": round(float(kb), 4),
+                         "imp": round(float(importance), 1), "freq": int(freq),
+                         "ents": ", ".join(rel_ents), "desc": _clean(desc, 200)})
+
+        # 5 ── cluster concepts by embedding → name each theme after its top concept
+        kept_emb = emb[[r["_i"] for r in rows]]
+        labels = _cluster(kept_emb)
+        best_in: Dict[int, Tuple[float, str]] = {}
+        for r, lab in zip(rows, labels):
+            if r["imp"] > best_in.get(lab, (-1.0, ""))[0]:
+                best_in[lab] = (r["imp"], r["Concept"])
+
+        # 6 ── rank, assign Core/Supporting/Derived tier, emit ordered records
+        ranked = sorted(zip(rows, labels), key=lambda rl: -rl[0]["imp"])
+        n = len(ranked)
+        out: List[Dict] = []
+        for rank, (r, lab) in enumerate(ranked):
+            tier = ("Core" if rank < max(1, n * 0.3)
+                    else "Supporting" if rank < max(2, n * 0.7) else "Derived")
+            out.append({
+                "Concept": r["Concept"], "Type": tier, "Importance": r["imp"],
+                "Relevance Score": r["kb"], "Theme / Cluster": best_in[lab][1],
+                "Frequency": r["freq"], "Related Entities": r["ents"],
+                "Description": r["desc"],
+            })
+        return out[:40]
+    except Exception as exc:
+        return [{"Concept": f"Error: {exc}", "Type": "", "Importance": 0,
+                 "Relevance Score": 0.0, "Theme / Cluster": "", "Frequency": 0,
+                 "Related Entities": "", "Description": ""}]
+
+# ── Entity extraction: spaCy NER + alias merge + importance/tiers ───────────────
+def build_entities(ent_counter: Counter, ent_sents: Dict[str, set],
+                   sents: List[str], concepts: List[Dict]) -> List[Dict]:
+    raw = [{"text": t, "type": l, "count": c} for (t, l), c in ent_counter.items()]
+    raw.sort(key=lambda e: (-len(e["text"]), -e["count"]))
+
+    # Merge aliases of the same type when one name's tokens subset another's
+    # (e.g. "Smith" → "John Smith", "Apple" → "Apple Inc").
+    canon: List[Dict] = []
+    for e in raw:
+        toks = set(e["text"].lower().split())
+        hit = None
+        for c in canon:
+            if c["type"] != e["type"]: continue
+            ctoks = set(c["text"].lower().split())
+            if toks and (toks <= ctoks or ctoks <= toks):
+                hit = c; break
+        if hit:
+            hit["count"] += e["count"]
+            hit["sent"] |= ent_sents.get(e["text"].lower(), set())
+        else:
+            canon.append({"text": e["text"], "type": e["type"], "count": e["count"],
+                          "sent": set(ent_sents.get(e["text"].lower(), set()))})
+
+    concept_terms = [c["Concept"].lower() for c in concepts[:20] if c.get("Concept")]
+    sents_low = [s.lower() for s in sents]
+    maxc = max((c["count"] for c in canon), default=1)
+
+    scored: List[Dict] = []
+    for c in canon:
+        freq_n = c["count"] / maxc
+        overlap = sum(1 for si in c["sent"] if si < len(sents_low)
+                      for t in concept_terms if t and t in sents_low[si])
+        conc_n = min(overlap / 6.0, 1.0)
+        importance = round(100 * (0.6 * freq_n + 0.4 * conc_n), 1)
+        desc = ""
+        for si in sorted(c["sent"]):
+            if si < len(sents) and 25 <= len(sents[si]) <= 240:
+                desc = sents[si]; break
+        scored.append({"text": c["text"], "type": c["type"], "count": c["count"],
+                       "imp": importance, "desc": _clean(desc, 200)})
+
+    scored.sort(key=lambda e: (-e["imp"], -e["count"]))
+    n = len(scored)
+    out: List[Dict] = []
+    for rank, e in enumerate(scored):
+        tier = ("Primary" if rank < max(1, n * 0.2)
+                else "Secondary" if rank < max(2, n * 0.55) else "Supporting")
+        out.append({"Entity": e["text"], "Type": e["type"],
+                    "Description": spacy.explain(e["type"]) or e["type"],
+                    "Tier": tier, "Importance": e["imp"],
+                    "Occurrences": e["count"], "Context": e["desc"]})
+    return out
+
+# ── Variables (regex) ───────────────────────────────────────────────────────────
 def extract_variables(text: str) -> List[Dict]:
     results, seen = [], set()
     for sent in sent_tokenize(text):
@@ -232,35 +550,7 @@ def extract_variables(text: str) -> List[Dict]:
                 except Exception: continue
     return results
 
-_SVO_DEPS = {"ROOT", "relcl", "xcomp", "advcl", "conj", "acl", "ccomp", "pcomp"}
-
-def extract_svo(text: str) -> List[Dict]:
-    results, seen = [], set()
-    for chunk in chunk_text(text, 40_000):
-        doc = NLP(chunk)
-        for sent in doc.sents:
-            for tok in sent:
-                if tok.pos_ != "VERB" or tok.dep_ not in _SVO_DEPS: continue
-                verb = tok.lemma_.lower()
-                subjs = [t for t in tok.lefts  if t.dep_ in ("nsubj","nsubjpass","csubj")]
-                objs  = [t for t in tok.rights if t.dep_ in ("dobj","attr","acomp")]
-                for prep in tok.rights:
-                    if prep.dep_ == "prep":
-                        objs += [c for c in prep.children if c.dep_ == "pobj"]
-                for s in subjs:
-                    st = _clean(" ".join(t.text for t in s.subtree
-                                        if t.dep_ not in ("det","punct") and len(t.text) > 1))
-                    for o in objs:
-                        ot = _clean(" ".join(t.text for t in o.subtree
-                                             if t.dep_ not in ("det","punct") and len(t.text) > 1))
-                        key = (st.lower()[:40], verb[:20], ot.lower()[:40])
-                        if key not in seen and st and ot and len(st) > 2:
-                            seen.add(key)
-                            results.append({"Subject": st, "Relationship": verb, "Object": ot,
-                                            "Rel. Type": "syntactic (SVO)",
-                                            "Source Sentence": _clean(sent.text, 250)})
-    return results[:200]
-
+# ── Causal / relational regex extraction (with confidence) ──────────────────────
 def extract_causal(text: str) -> List[Dict]:
     results, seen = [], set()
     for sent in sent_tokenize(text):
@@ -272,89 +562,239 @@ def extract_causal(text: str) -> List[Dict]:
                     if key not in seen and len(s) > 2 and len(o) > 2:
                         seen.add(key)
                         results.append({"Subject": s, "Relationship": rel, "Object": o,
-                                        "Rel. Type": "causal", "Source Sentence": _clean(sent, 250)})
+                                        "Rel. Type": "causal",
+                                        "Confidence": _CAUSAL_CONF.get(rel, 65),
+                                        "Source Sentence": _clean(sent, 250)})
                 except Exception: continue
     return results[:200]
 
-def identify_problems(rels: List[Dict], entities: List[Dict], text: str) -> List[Dict]:
-    problems = []
-    ent_names = {e["Entity"].lower() for e in entities}
+def _display_rel(r: Dict) -> Dict:
+    """Strip internal keys (_si …) and fix column order for the relationships table."""
+    return {"Subject": r.get("Subject", ""), "Relationship": r.get("Relationship", ""),
+            "Object": r.get("Object", ""), "Rel. Type": r.get("Rel. Type", ""),
+            "Confidence": r.get("Confidence", ""), "Source Sentence": r.get("Source Sentence", "")}
 
+# ── Dependency mapping ──────────────────────────────────────────────────────────
+def build_dependencies(rels: List[Dict]) -> List[Dict]:
     G = nx.DiGraph()
     for r in rels:
-        s, o = r.get("Subject",""), r.get("Object","")
-        if s and o: G.add_edge(s.lower()[:40], o.lower()[:40])
+        rel = r.get("Relationship", "").lower()
+        if not any(w == rel or (" " in w and w in rel) for w in DEP_REL_WORDS):
+            continue
+        s = _node_label(r.get("Subject", "")).lower(); o = _node_label(r.get("Object", "")).lower()
+        if not s or not o or s == o: continue
+        if G.has_edge(s, o): G[s][o]["w"] += 1
+        else: G.add_edge(s, o, w=1)
+    if G.number_of_nodes() == 0:
+        return []
 
-    cycles = []
+    cyc_nodes = set()
     try:
-        cycles = list(nx.simple_cycles(G))
+        for c in nx.simple_cycles(G): cyc_nodes.update(c)
     except Exception:
         pass
 
-    cycle_nodes = {n for c in cycles for n in c}
+    out = []
+    for node in G.nodes():
+        direct = sorted(G.successors(node))
+        if not direct: continue
+        try: total = len(nx.descendants(G, node))
+        except Exception: total = len(direct)
+        out.append({"Node": node, "Depends On": ", ".join(direct[:6]),
+                    "Direct Deps": len(direct), "Total (incl. indirect)": total,
+                    "Strength": sum(G[node][d]["w"] for d in direct),
+                    "Circular?": "Yes" if node in cyc_nodes else "No"})
+    out.sort(key=lambda d: (-d["Total (incl. indirect)"], -d["Strength"]))
+    return out[:80]
 
+# ── Causal-chain construction ───────────────────────────────────────────────────
+def build_causal_chains(causal: List[Dict]) -> List[Dict]:
+    G = nx.DiGraph(); conf: Dict[Tuple[str, str], float] = {}
+    for r in causal:
+        s = _node_label(r.get("Subject", "")).lower(); o = _node_label(r.get("Object", "")).lower()
+        if not s or not o or s == o: continue
+        G.add_edge(s, o); conf[(s, o)] = max(conf.get((s, o), 0), r.get("Confidence", 65))
+    if G.number_of_edges() == 0:
+        return []
+
+    # Break cycles so longest-path search terminates.
+    try:
+        while True:
+            cyc = nx.find_cycle(G, orientation="original")
+            G.remove_edge(cyc[0][0], cyc[0][1])
+    except nx.NetworkXNoCycle:
+        pass
+
+    roots = [n for n in G.nodes if G.in_degree(n) == 0]
+    chains, seen, guard = [], set(), 0
+    for root in roots:
+        stack = [(root, [root])]; best = None
+        while stack and guard < 50_000:
+            guard += 1
+            node, path = stack.pop()
+            succ = [s for s in G.successors(node) if s not in path]
+            if not succ:
+                if best is None or len(path) > len(best): best = path
+            for s in succ:
+                stack.append((s, path + [s]))
+        if best and len(best) >= 2:
+            key = tuple(best)
+            if key in seen: continue
+            seen.add(key)
+            cs = [conf.get((best[k], best[k + 1]), 65) for k in range(len(best) - 1)]
+            chains.append({"Causal Chain": " → ".join(best), "Length": len(best),
+                           "Root Cause": best[0], "Final Outcome": best[-1],
+                           "Avg Confidence": round(sum(cs) / len(cs), 1)})
+    chains.sort(key=lambda c: (-c["Length"], -c["Avg Confidence"]))
+    return chains[:60]
+
+# ── Contradiction detection ─────────────────────────────────────────────────────
+def detect_contradictions(rels: List[Dict], variables: List[Dict],
+                          sents: List[str]) -> List[Dict]:
+    out, seen = [], set()
+
+    # 1 ── same variable assigned different values
+    byname: Dict[str, list] = defaultdict(list)
+    for v in variables:
+        vals = byname[v["Variable / Parameter"].lower()]
+        if v["Value"] not in vals:
+            vals.append(v["Value"])
+    for name, vals in byname.items():
+        if len(vals) > 1:
+            out.append({"Statement A": f"{name} = {vals[0]}",
+                        "Statement B": f"{name} = {vals[1]}",
+                        "Conflict Type": "variable value conflict", "Severity": "Medium"})
+
+    # 2 ── affirmation/negation + opposing-predicate conflicts on the same pair
+    anti: Dict[str, str] = {}
+    for a, b in ANTONYM_PAIRS: anti[a] = b; anti[b] = a
+    pair_map: Dict[Tuple[str, str], list] = defaultdict(list)
     for r in rels:
-        s   = r.get("Subject","").lower()
-        rel = r.get("Relationship","").lower()
-        o   = r.get("Object","").lower()
-        src = r.get("Source Sentence","")
+        s = r.get("Subject", "").lower().strip(); o = r.get("Object", "").lower().strip()
+        if len(s) < 3 or len(o) < 3: continue
+        src = r.get("Source Sentence", "")
+        neg = any(ng in src.lower() for ng in _NEGATIONS)
+        pair_map[(s, o)].append((r.get("Relationship", "").lower(), neg, src))
+    for (s, o), lst in pair_map.items():
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                r1, n1, src1 = lst[i]; r2, n2, src2 = lst[j]
+                if r1 == r2 and n1 != n2:
+                    ctype = "affirmation vs negation"
+                elif anti.get(r1) == r2 or anti.get(r2) == r1:
+                    ctype = "opposing relationship"
+                else:
+                    continue
+                key = (s, o, ctype)
+                if key in seen: continue
+                seen.add(key)
+                out.append({"Statement A": _clean(src1, 160) or f"{s} {r1} {o}",
+                            "Statement B": _clean(src2, 160) or f"{s} {r2} {o}",
+                            "Conflict Type": ctype, "Severity": "High"})
+    return out[:60]
 
-        sev = None
-        ptype = ""
-        if any(w in rel for w in PROBLEM_WORDS) or any(w in s for w in PROBLEM_WORDS) \
-                or any(w in o for w in PROBLEM_WORDS):
-            sev = "High"; ptype = "problem keyword"
-        elif s in cycle_nodes or o in cycle_nodes:
-            sev = "Medium"; ptype = "circular dependency"
-        else:
-            ctx = src.lower()
-            if any(w in ctx for w in PROBLEM_WORDS):
-                sev = "Low"; ptype = "problematic context"
+# ── Assumption discovery ────────────────────────────────────────────────────────
+def detect_assumptions(sents: List[str]) -> List[Dict]:
+    out, seen = [], set()
+    for s in sents:
+        sl = s.lower()
+        for marker, conf in ASSUMPTION_MARKERS.items():
+            if marker in sl:
+                key = sl[:80]
+                if key in seen: break
+                seen.add(key)
+                explicit = conf >= 70
+                out.append({"Assumption": _clean(s, 220),
+                            "Type": "Explicit" if explicit else "Implicit",
+                            "Marker": marker, "Confidence": conf,
+                            "Impact if False": ("Core conclusions built on this premise may fail."
+                                                if explicit else
+                                                "Some downstream reasoning may be weakened.")})
+                break
+    out.sort(key=lambda a: -a["Confidence"])
+    return out[:60]
 
-        if sev:
-            problems.append({"Subject": r["Subject"], "Relationship": r["Relationship"],
-                              "Object": r["Object"], "Problem Type": ptype,
-                              "Severity": sev, "Source Sentence": src})
-    return problems
-
-# ── Knowledge graph ───────────────────────────────────────────────────────────
-def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
-                          problems: List[Dict], max_nodes: int = 120) -> Dict:
-    """Build a knowledge graph from extracted relationships + entities."""
-    ent_type, ent_count = {}, {}
-    for e in entities:
-        key = e["Entity"].lower()
-        if key not in ent_type:
-            ent_type[key] = e["Type"]
-            ent_count[key] = e["Occurrences"]
-
-    problem_pairs = {(p["Subject"].lower()[:40], p["Object"].lower()[:40], )
-                     for p in problems}
+# ── Problem detection (severity tiers + root causes + affected entities) ─────────
+def identify_problems(rels: List[Dict], entities: List[Dict], text: str,
+                      sents: List[str], causal: List[Dict]) -> List[Dict]:
+    cg = nx.DiGraph()
+    for r in causal:
+        s = _node_label(r.get("Subject", "")).lower(); o = _node_label(r.get("Object", "")).lower()
+        if s and o and s != o: cg.add_edge(s, o)
 
     G = nx.DiGraph()
     for r in rels:
-        s = _clean(r.get("Subject", ""), 40)
-        o = _clean(r.get("Object", ""), 40)
-        if not s or not o or s.lower() == o.lower():
-            continue
-        sk, ok = s.lower(), o.lower()
-        for node_key, label in ((sk, s), (ok, o)):
-            if G.has_node(node_key):
-                G.nodes[node_key]["weight"] += 1
-            else:
-                G.add_node(node_key, label=label,
-                           etype=ent_type.get(node_key, ""),
-                           weight=max(ent_count.get(node_key, 1), 1))
-        if G.has_edge(sk, ok):
-            G[sk][ok]["weight"] += 1
-        else:
-            G.add_edge(sk, ok, label=r.get("Relationship", ""),
-                       rtype=r.get("Rel. Type", ""),
-                       sentence=_clean(r.get("Source Sentence", ""), 200),
-                       problem=(sk[:40], ok[:40]) in problem_pairs,
-                       weight=1)
+        s, o = r.get("Subject", ""), r.get("Object", "")
+        if s and o: G.add_edge(s.lower()[:40], o.lower()[:40])
+    cycles = []
+    try: cycles = list(nx.simple_cycles(G))
+    except Exception: pass
+    cycle_nodes = {n for c in cycles for n in c}
 
-    # Keep the graph readable: most-connected nodes only, drop isolates
+    ent_names = [e["Entity"] for e in entities]
+    problems, seen = [], set()
+    for r in rels:
+        s = r.get("Subject", "").lower(); rel = r.get("Relationship", "").lower()
+        o = r.get("Object", "").lower(); src = r.get("Source Sentence", "")
+        srcl = src.lower()
+
+        if any(w in srcl for w in SECURITY_WORDS) or \
+           any(w in rel or w in s or w in o for w in SECURITY_WORDS):
+            sev, ptype = "Critical", "security / safety risk"
+        elif any(w in rel for w in PROBLEM_WORDS) or any(w in s for w in PROBLEM_WORDS) \
+                or any(w in o for w in PROBLEM_WORDS):
+            sev, ptype = "High", "problem keyword"
+        elif s[:40] in cycle_nodes or o[:40] in cycle_nodes:
+            sev, ptype = "Medium", "circular dependency"
+        elif any(w in srcl for w in PROBLEM_WORDS):
+            sev, ptype = "Low", "problematic context"
+        else:
+            continue
+
+        key = (s[:40], rel[:20], o[:40])
+        if key in seen: continue
+        seen.add(key)
+
+        nl = _node_label(r.get("Subject", "")).lower()
+        roots = sorted(nx.ancestors(cg, nl))[:3] if cg.has_node(nl) else []
+        affected = [e for e in ent_names if e.lower() in srcl][:4]
+        problems.append({"Subject": r["Subject"], "Relationship": r["Relationship"],
+                         "Object": r["Object"], "Problem Type": ptype, "Severity": sev,
+                         "Root Causes": ", ".join(roots),
+                         "Affected Entities": ", ".join(affected),
+                         "Source Sentence": _clean(src, 200)})
+
+    sev_rank = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+    problems.sort(key=lambda p: sev_rank.get(p["Severity"], 9))
+    return problems
+
+# ── Knowledge graph (influence / betweenness / key nodes) ───────────────────────
+def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
+                          problems: List[Dict], concepts: List[Dict],
+                          max_nodes: int = 120) -> Dict:
+    ent_type, ent_count = {}, {}
+    for e in entities:
+        k = e["Entity"].lower()
+        if k not in ent_type:
+            ent_type[k] = e["Type"]; ent_count[k] = e.get("Occurrences", 1)
+    concept_set = {c["Concept"].lower() for c in concepts if c.get("Concept")}
+    problem_pairs = {(p["Subject"].lower()[:40], p["Object"].lower()[:40]) for p in problems}
+
+    G = nx.DiGraph()
+    for r in rels:
+        s = _clean(r.get("Subject", ""), 40); o = _clean(r.get("Object", ""), 40)
+        if not s or not o or s.lower() == o.lower(): continue
+        sk, ok = s.lower(), o.lower()
+        for nk, label in ((sk, s), (ok, o)):
+            if G.has_node(nk): G.nodes[nk]["weight"] += 1
+            else: G.add_node(nk, label=label, etype=ent_type.get(nk, ""),
+                             weight=max(ent_count.get(nk, 1), 1))
+        if G.has_edge(sk, ok): G[sk][ok]["weight"] += 1
+        else: G.add_edge(sk, ok, label=r.get("Relationship", ""),
+                         rtype=r.get("Rel. Type", ""),
+                         sentence=_clean(r.get("Source Sentence", ""), 200),
+                         problem=(sk[:40], ok[:40]) in problem_pairs, weight=1)
+
     if G.number_of_nodes() > max_nodes:
         keep = [n for n, _ in sorted(G.degree, key=lambda x: -x[1])[:max_nodes]]
         G = G.subgraph(keep).copy()
@@ -363,27 +803,92 @@ def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
     comm_of: Dict[str, int] = {}
     try:
         if G.number_of_nodes() > 2:
-            communities = nx.community.greedy_modularity_communities(G.to_undirected())
-            comm_of = {n: i for i, c in enumerate(communities) for n in c}
+            comms = nx.community.greedy_modularity_communities(G.to_undirected())
+            comm_of = {n: i for i, c in enumerate(comms) for n in c}
     except Exception:
         pass
 
-    centrality = nx.degree_centrality(G) if G.number_of_nodes() else {}
+    deg_c = nx.degree_centrality(G) if G.number_of_nodes() else {}
+    try:
+        btw_c = nx.betweenness_centrality(G) if G.number_of_nodes() > 2 else {}
+    except Exception:
+        btw_c = {}
 
-    nodes = [{"id": n, "label": d["label"],
-              "type": d.get("etype") or "Concept",
-              "size": d.get("weight", 1),
-              "centrality": round(centrality.get(n, 0.0), 4),
+    def category(nk: str) -> str:
+        if ent_type.get(nk): return ent_type[nk]
+        return "Concept"
+
+    influence = {n: deg_c.get(n, 0.0) * G.nodes[n].get("weight", 1) for n in G.nodes()}
+    nodes = [{"id": n, "label": d["label"], "type": category(n),
+              "size": d.get("weight", 1), "centrality": round(deg_c.get(n, 0.0), 4),
+              "betweenness": round(btw_c.get(n, 0.0), 4),
+              "influence": round(influence.get(n, 0.0), 4),
               "group": comm_of.get(n, 0)}
              for n, d in G.nodes(data=True)]
-    edges = [{"from": u, "to": v,
-              "label": d.get("label", ""), "rtype": d.get("rtype", ""),
-              "sentence": d.get("sentence", ""),
-              "problem": bool(d.get("problem")), "weight": d.get("weight", 1)}
+    edges = [{"from": u, "to": v, "label": d.get("label", ""), "rtype": d.get("rtype", ""),
+              "sentence": d.get("sentence", ""), "problem": bool(d.get("problem")),
+              "weight": d.get("weight", 1)}
              for u, v, d in G.edges(data=True)]
+
+    key: Dict[str, str] = {}
+    if nodes:
+        key["most_influential"] = max(nodes, key=lambda n: n["influence"])["label"]
+        key["most_connected"] = max(nodes, key=lambda n: n["centrality"])["label"]
+        if btw_c:
+            key["bridge"] = max(nodes, key=lambda n: n["betweenness"])["label"]
     return {"nodes": nodes, "edges": edges,
             "stats": {"nodes": len(nodes), "edges": len(edges),
-                      "communities": len(set(comm_of.values())) if comm_of else 0}}
+                      "communities": len(set(comm_of.values())) if comm_of else 0, **key}}
+
+# ── Executive intelligence roll-up ──────────────────────────────────────────────
+def build_executive_insights(entities, concepts, variables, problems, rels,
+                              dependencies, causal_chains, contradictions,
+                              assumptions, graph) -> List[Dict]:
+    ins: List[Dict] = []
+    def add(cat, finding): ins.append({"Category": cat, "Finding": _clean(str(finding), 300)})
+
+    if concepts and concepts[0].get("Concept"):
+        add("Most Important Concept",
+            f'{concepts[0]["Concept"]} (importance {concepts[0]["Importance"]})')
+    if entities:
+        add("Primary Entity",
+            f'{entities[0]["Entity"]} — {entities[0]["Type"]}, {entities[0]["Occurrences"]} mentions')
+
+    crit = [p for p in problems if p["Severity"] in ("Critical", "High")]
+    if crit:
+        add(f'Most Critical Problem ({crit[0]["Severity"]})',
+            f'{crit[0]["Subject"]} {crit[0]["Relationship"]} {crit[0]["Object"]}')
+
+    gk = graph.get("stats", {})
+    if gk.get("most_influential"): add("Most Influential Node", gk["most_influential"])
+    if gk.get("bridge"): add("Key Bridge / Connector", gk["bridge"])
+
+    themes = Counter(c.get("Theme / Cluster", "") for c in concepts if c.get("Theme / Cluster"))
+    if themes:
+        t, cnt = themes.most_common(1)[0]
+        add("Dominant Theme", f'"{t}" anchors {cnt} related concepts')
+
+    circ = [d for d in dependencies if d.get("Circular?") == "Yes"]
+    if circ:
+        add("System Weakness", f'{len(circ)} circular dependencies (e.g. {circ[0]["Node"]})')
+    if contradictions:
+        add("Risk — Contradiction",
+            f'{len(contradictions)} conflicting statements (e.g. {contradictions[0]["Conflict Type"]})')
+    strong_assum = [a for a in assumptions if a["Confidence"] >= 78]
+    if strong_assum:
+        add("Risk — Assumption",
+            f'{len(strong_assum)} strong assumptions underpin the reasoning')
+
+    if causal_chains:
+        rc = Counter(c["Root Cause"] for c in causal_chains).most_common(1)[0][0]
+        add("Root Cause", f'"{rc}" initiates the longest causal chain')
+
+    if crit: add("Recommendation", f'Prioritise mitigation of {len(crit)} high/critical problems')
+    if circ: add("Recommendation", "Break circular dependencies to improve robustness")
+    if contradictions: add("Recommendation", "Reconcile contradictory statements before acting")
+    if not crit and not contradictions:
+        add("Strategic Insight", "No critical problems or contradictions — content is internally consistent")
+    return ins
 
 # ── Export helpers ────────────────────────────────────────────────────────────
 def _export_excel_bytes(results: Dict) -> bytes:
@@ -419,13 +924,18 @@ def _export_excel_bytes(results: Dict) -> bytes:
     ws("Key Concepts",           results["concepts"])
     ws("Variables",              results["variables"])
     ws("Relationships",          results["relationships"])
+    ws("Dependencies",           results["dependencies"])
+    ws("Causal Chains",          results["causal_chains"])
     sp = ws("Problem Relationships", results["problems"], hfill=RH)
     if results["problems"]:
         keys = list(results["problems"][0].keys())
         sev_col = keys.index("Severity") + 1
         for i in range(2, sp.max_row + 1):
-            fill = RF if sp.cell(i, sev_col).value == "High" else YF
+            fill = RF if sp.cell(i, sev_col).value in ("High", "Critical") else YF
             for cell in sp[i]: cell.fill = fill
+    ws("Contradictions",         results["contradictions"], hfill=RH)
+    ws("Assumptions",            results["assumptions"])
+    ws("Executive Insights",     results["insights"])
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -436,7 +946,9 @@ def _export_csv_bytes(results: Dict) -> bytes:
     sheets = {"summary": [results["summary"]], "files": results["files"],
               "entities": results["entities"], "concepts": results["concepts"],
               "variables": results["variables"], "relationships": results["relationships"],
-              "problems": results["problems"]}
+              "dependencies": results["dependencies"], "causal_chains": results["causal_chains"],
+              "problems": results["problems"], "contradictions": results["contradictions"],
+              "assumptions": results["assumptions"], "insights": results["insights"]}
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in sheets.items():
             csv_str = pd.DataFrame(data if data else [{name: "No data"}]).to_csv(index=False, encoding="utf-8-sig")
@@ -459,12 +971,17 @@ def _export_markdown_bytes(results: Dict) -> bytes:
            "| Metric | Value |", "|--------|-------|"]
     for k, v in s.items(): out.append(f"| {k} | {v} |")
     out += ["", "---", ""]
-    out += section("Files Analyzed",        results["files"])
-    out += section("Named Entities",        results["entities"])
-    out += section("Key Concepts",          results["concepts"])
-    out += section("Variables",             results["variables"])
-    out += section("Relationships",         results["relationships"])
-    out += section("Problem Relationships", results["problems"])
+    out += section("Executive Insights",     results["insights"])
+    out += section("Files Analyzed",         results["files"])
+    out += section("Named Entities",         results["entities"])
+    out += section("Key Concepts",           results["concepts"])
+    out += section("Variables",              results["variables"])
+    out += section("Relationships",          results["relationships"])
+    out += section("Dependency Map",         results["dependencies"])
+    out += section("Causal Chains",          results["causal_chains"])
+    out += section("Problem Relationships",  results["problems"])
+    out += section("Contradictions",         results["contradictions"])
+    out += section("Assumptions",            results["assumptions"])
     return "\n".join(out).encode("utf-8")
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
@@ -509,28 +1026,44 @@ def analyze():
     if len(combined) > 400_000:
         combined = combined[:400_000]
 
-    entities  = extract_entities(combined)
-    concepts  = extract_concepts(combined)
-    variables = extract_variables(combined)
-    svo       = extract_svo(combined)
-    causal    = extract_causal(combined)
-    all_rels  = svo + causal
-    problems  = identify_problems(all_rels, entities, combined)
-    graph     = build_knowledge_graph(all_rels, entities, problems)
+    # Preprocessing → single spaCy pass → KeyBERT reasoning layer → analyses.
+    combined        = preprocess_text(combined)
+    sents, ent_counter, ent_sents, svo = parse_document(combined)
+    concepts        = extract_concepts(combined, sents, ent_sents)
+    entities        = build_entities(ent_counter, ent_sents, sents, concepts)
+    variables       = extract_variables(combined)
+    causal          = extract_causal(combined)
+    all_rels        = svo + causal
+    problems        = identify_problems(all_rels, entities, combined, sents, causal)
+    dependencies    = build_dependencies(all_rels)
+    causal_chains   = build_causal_chains(causal)
+    contradictions  = detect_contradictions(all_rels, variables, sents)
+    assumptions     = detect_assumptions(sents)
+    rels_display    = [_display_rel(r) for r in all_rels]
+    graph           = build_knowledge_graph(all_rels, entities, problems, concepts)
+    insights        = build_executive_insights(entities, concepts, variables, problems,
+                                                all_rels, dependencies, causal_chains,
+                                                contradictions, assumptions, graph)
 
     sid = str(uuid.uuid4())
     results = {
         "files": records, "entities": entities, "concepts": concepts,
-        "variables": variables, "relationships": all_rels, "problems": problems,
-        "graph": graph,
+        "variables": variables, "relationships": rels_display, "problems": problems,
+        "dependencies": dependencies, "causal_chains": causal_chains,
+        "contradictions": contradictions, "assumptions": assumptions,
+        "insights": insights, "graph": graph,
         "summary": {
             "Files Analyzed":       len(records),
             "Total Words":          f"{sum(r.get('Words', 0) for r in records):,}",
             "Entities Found":       len(entities),
             "Key Concepts":         len(concepts),
             "Variables Detected":   len(variables),
-            "Relationships Mapped": len(all_rels),
-            "Problem Relationships":len(problems),
+            "Relationships Mapped": len(rels_display),
+            "Dependencies":         len(dependencies),
+            "Causal Chains":        len(causal_chains),
+            "Problems":             len(problems),
+            "Contradictions":       len(contradictions),
+            "Assumptions":          len(assumptions),
             "Graph Nodes":          graph["stats"]["nodes"],
             "Graph Edges":          graph["stats"]["edges"],
             "NLP Model":            NLP_MODEL,
