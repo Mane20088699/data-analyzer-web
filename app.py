@@ -317,6 +317,74 @@ def identify_problems(rels: List[Dict], entities: List[Dict], text: str) -> List
                               "Severity": sev, "Source Sentence": src})
     return problems
 
+# ── Knowledge graph ───────────────────────────────────────────────────────────
+def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
+                          problems: List[Dict], max_nodes: int = 120) -> Dict:
+    """Build a knowledge graph from extracted relationships + entities."""
+    ent_type, ent_count = {}, {}
+    for e in entities:
+        key = e["Entity"].lower()
+        if key not in ent_type:
+            ent_type[key] = e["Type"]
+            ent_count[key] = e["Occurrences"]
+
+    problem_pairs = {(p["Subject"].lower()[:40], p["Object"].lower()[:40], )
+                     for p in problems}
+
+    G = nx.DiGraph()
+    for r in rels:
+        s = _clean(r.get("Subject", ""), 40)
+        o = _clean(r.get("Object", ""), 40)
+        if not s or not o or s.lower() == o.lower():
+            continue
+        sk, ok = s.lower(), o.lower()
+        for node_key, label in ((sk, s), (ok, o)):
+            if G.has_node(node_key):
+                G.nodes[node_key]["weight"] += 1
+            else:
+                G.add_node(node_key, label=label,
+                           etype=ent_type.get(node_key, ""),
+                           weight=max(ent_count.get(node_key, 1), 1))
+        if G.has_edge(sk, ok):
+            G[sk][ok]["weight"] += 1
+        else:
+            G.add_edge(sk, ok, label=r.get("Relationship", ""),
+                       rtype=r.get("Rel. Type", ""),
+                       sentence=_clean(r.get("Source Sentence", ""), 200),
+                       problem=(sk[:40], ok[:40]) in problem_pairs,
+                       weight=1)
+
+    # Keep the graph readable: most-connected nodes only, drop isolates
+    if G.number_of_nodes() > max_nodes:
+        keep = [n for n, _ in sorted(G.degree, key=lambda x: -x[1])[:max_nodes]]
+        G = G.subgraph(keep).copy()
+    G.remove_nodes_from(list(nx.isolates(G)))
+
+    comm_of: Dict[str, int] = {}
+    try:
+        if G.number_of_nodes() > 2:
+            communities = nx.community.greedy_modularity_communities(G.to_undirected())
+            comm_of = {n: i for i, c in enumerate(communities) for n in c}
+    except Exception:
+        pass
+
+    centrality = nx.degree_centrality(G) if G.number_of_nodes() else {}
+
+    nodes = [{"id": n, "label": d["label"],
+              "type": d.get("etype") or "Concept",
+              "size": d.get("weight", 1),
+              "centrality": round(centrality.get(n, 0.0), 4),
+              "group": comm_of.get(n, 0)}
+             for n, d in G.nodes(data=True)]
+    edges = [{"from": u, "to": v,
+              "label": d.get("label", ""), "rtype": d.get("rtype", ""),
+              "sentence": d.get("sentence", ""),
+              "problem": bool(d.get("problem")), "weight": d.get("weight", 1)}
+             for u, v, d in G.edges(data=True)]
+    return {"nodes": nodes, "edges": edges,
+            "stats": {"nodes": len(nodes), "edges": len(edges),
+                      "communities": len(set(comm_of.values())) if comm_of else 0}}
+
 # ── Export helpers ────────────────────────────────────────────────────────────
 def _export_excel_bytes(results: Dict) -> bytes:
     wb = Workbook()
@@ -448,11 +516,13 @@ def analyze():
     causal    = extract_causal(combined)
     all_rels  = svo + causal
     problems  = identify_problems(all_rels, entities, combined)
+    graph     = build_knowledge_graph(all_rels, entities, problems)
 
     sid = str(uuid.uuid4())
     results = {
         "files": records, "entities": entities, "concepts": concepts,
         "variables": variables, "relationships": all_rels, "problems": problems,
+        "graph": graph,
         "summary": {
             "Files Analyzed":       len(records),
             "Total Words":          f"{sum(r.get('Words', 0) for r in records):,}",
@@ -461,6 +531,8 @@ def analyze():
             "Variables Detected":   len(variables),
             "Relationships Mapped": len(all_rels),
             "Problem Relationships":len(problems),
+            "Graph Nodes":          graph["stats"]["nodes"],
+            "Graph Edges":          graph["stats"]["edges"],
             "NLP Model":            NLP_MODEL,
             "Concept Model":        "all-MiniLM-L6-v2 (KeyBERT)",
         },
@@ -489,9 +561,29 @@ def export_results(sid: str, fmt: str):
                          as_attachment=True, mimetype="text/markdown")
     return "Unknown format.", 400
 
+def _lan_ip() -> str:
+    """Pick the real LAN address, preferring private ranges over VPN/CGNAT (100.64/10)."""
+    import socket
+    candidates = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith(("127.", "169.254.")):
+                candidates.append(ip)
+    except Exception:
+        pass
+    for ip in candidates:
+        if ip.startswith(("192.168.", "10.")) or \
+           (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31):
+            return ip
+    return candidates[0] if candidates else "127.0.0.1"
+
 if __name__ == "__main__":
     import webbrowser, threading
+    lan = _lan_ip()
     url = "http://localhost:5000"
     threading.Timer(1.2, lambda: webbrowser.open(url)).start()
-    print(f"Data Analyzer Web running at {url}")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    print(f"Data Analyzer Web running at:")
+    print(f"  This computer : {url}")
+    print(f"  On your WiFi  : http://{lan}:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

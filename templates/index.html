@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Data Analyzer</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
   <style>
     /* ── Shader canvas background ───────────────────────────────────────── */
     #shader-canvas {
@@ -156,6 +157,8 @@
                 onclick="showTab('relationships',this)">Relationships</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
                 onclick="showTab('problems',this)">Problems</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('graph',this)">Knowledge Graph</button>
       </div>
       <div class="overflow-auto max-h-[420px]" id="table-area">
         <p class="text-gray-400 text-center py-12 text-sm">Run analysis to see results.</p>
@@ -437,8 +440,14 @@ function showTab(name, btnEl) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   if (btnEl) btnEl.classList.add('active');
   if (!results) return;
-  const data = results[name];
   const area = document.getElementById('table-area');
+  if (name === 'graph') {
+    area.style.maxHeight = 'none';
+    renderGraph(area);
+    return;
+  }
+  area.style.maxHeight = '';
+  const data = results[name];
   if (!data || data.length === 0) {
     area.innerHTML = '<p class="text-gray-400 text-center py-12 text-sm">No data found.</p>';
     return;
@@ -458,6 +467,69 @@ function showTab(name, btnEl) {
   });
   html += '</tbody></table>';
   area.innerHTML = html;
+}
+
+/* ── Knowledge graph ────────────────────────────────────────────────────── */
+const GROUP_COLORS = ['#2563eb','#16a34a','#d97706','#9333ea','#0891b2',
+                      '#db2777','#65a30d','#dc2626','#7c3aed','#0d9488'];
+let network = null;
+
+function renderGraph(area) {
+  const g = results.graph;
+  if (!g || !g.nodes || g.nodes.length === 0) {
+    area.innerHTML = '<p class="text-gray-400 text-center py-12 text-sm">No relationships found to build a graph.</p>';
+    return;
+  }
+  area.innerHTML = `
+    <div class="flex items-center gap-4 px-4 py-2 border-b border-gray-100 text-xs text-gray-500 flex-wrap">
+      <span><b class="text-gray-700">${g.stats.nodes}</b> nodes</span>
+      <span><b class="text-gray-700">${g.stats.edges}</b> edges</span>
+      <span><b class="text-gray-700">${g.stats.communities}</b> clusters</span>
+      <span class="ml-auto">Node size = connectivity · color = cluster ·
+        <span class="text-red-500 font-semibold">red edges</span> = problem relationships ·
+        drag / scroll to explore</span>
+    </div>
+    <div id="kg-container" style="height:520px;"></div>`;
+
+  const nodes = new vis.DataSet(g.nodes.map(n => ({
+    id: n.id,
+    label: n.label,
+    value: 5 + n.centrality * 100,
+    color: { background: GROUP_COLORS[n.group % GROUP_COLORS.length],
+             border: '#1e3a8a',
+             highlight: { background: '#facc15', border: '#1e3a8a' } },
+    title: `${n.label}\nType: ${n.type}\nMentions: ${n.size}\nCentrality: ${n.centrality}`,
+    font: { color: '#111827', size: 13 },
+  })));
+
+  const edges = new vis.DataSet(g.edges.map((e, i) => ({
+    id: i,
+    from: e.from,
+    to: e.to,
+    label: e.label,
+    arrows: 'to',
+    width: Math.min(1 + e.weight, 5),
+    color: e.problem ? { color: '#dc2626', highlight: '#b91c1c' }
+                     : { color: '#94a3b8', highlight: '#2563eb' },
+    font: { size: 10, color: '#64748b', strokeWidth: 4, strokeColor: '#ffffff' },
+    title: `${e.from} —${e.label}→ ${e.to}\n[${e.rtype}]\n${e.sentence}`,
+  })));
+
+  if (network) { network.destroy(); network = null; }
+  network = new vis.Network(document.getElementById('kg-container'),
+    { nodes, edges },
+    {
+      nodes: { shape: 'dot', scaling: { min: 8, max: 34 } },
+      edges: { smooth: { type: 'continuous' } },
+      physics: {
+        solver: 'forceAtlas2Based',
+        forceAtlas2Based: { gravitationalConstant: -60, springLength: 120,
+                            springConstant: 0.06, damping: 0.4 },
+        stabilization: { iterations: 200 },
+      },
+      interaction: { hover: true, tooltipDelay: 120, navigationButtons: true },
+    });
+  network.once('stabilizationIterationsDone', () => network.setOptions({ physics: false }));
 }
 
 /* ── Export ─────────────────────────────────────────────────────────────── */
