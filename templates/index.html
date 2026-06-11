@@ -102,9 +102,9 @@
       </svg>
       <p class="text-gray-500 text-sm">Drop files here or
         <span class="text-blue-600 font-medium">browse</span></p>
-      <p class="text-gray-400 text-xs mt-1">PDF, Word (.docx), TXT, ASC, MD, CSV</p>
+      <p class="text-gray-400 text-xs mt-1">PDF, Word, PowerPoint, Excel, HTML, CSV, JSON, XML, EPUB, TXT, MD — converted to Markdown via MarkItDown</p>
       <input id="file-input" type="file" class="hidden" multiple
-             accept=".pdf,.docx,.doc,.txt,.text,.asc,.ascii,.log,.md,.csv"
+             accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.html,.htm,.json,.xml,.epub,.txt,.text,.asc,.ascii,.log,.md,.markdown"
              onchange="addFiles(this.files)" />
     </div>
 
@@ -150,6 +150,10 @@
                 onclick="showTab('files',this)">Files</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
                 onclick="showTab('entities',this)">Entities</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('typed_entities',this)">Typed Entities</button>
+        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
+                onclick="showTab('structured',this)">Structured Data</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
                 onclick="showTab('concepts',this)">Key Concepts</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
@@ -496,8 +500,10 @@ function renderGraph(area) {
       <span><b class="text-gray-700">${g.stats.nodes}</b> nodes</span>
       <span><b class="text-gray-700">${g.stats.edges}</b> edges</span>
       <span><b class="text-gray-700">${g.stats.communities}</b> clusters</span>
+      <span><b class="text-gray-700">${g.stats.inferred_edges ?? 0}</b> inferred</span>
       <span class="ml-auto">Node size = connectivity · color = cluster ·
-        <span class="text-red-500 font-semibold">red edges</span> = problem relationships ·
+        <span class="text-red-500 font-semibold">red</span> = problem ·
+        <span class="text-purple-500 font-semibold">purple dashed</span> = inferred ·
         drag / scroll to explore</span>
     </div>
     <div id="kg-container" style="height:520px;"></div>`;
@@ -519,9 +525,11 @@ function renderGraph(area) {
     to: e.to,
     label: e.label,
     arrows: 'to',
+    dashes: e.inferred ? [6, 6] : false,
     width: Math.min(1 + e.weight, 5),
-    color: e.problem ? { color: '#dc2626', highlight: '#b91c1c' }
-                     : { color: '#94a3b8', highlight: '#2563eb' },
+    color: e.inferred ? { color: '#a855f7', highlight: '#7c3aed' }
+                      : e.problem ? { color: '#dc2626', highlight: '#b91c1c' }
+                                  : { color: '#94a3b8', highlight: '#2563eb' },
     font: { size: 10, color: '#64748b', strokeWidth: 4, strokeColor: '#ffffff' },
     title: `${e.from} —${e.label}→ ${e.to}\n[${e.rtype}]\n${e.sentence}`,
   })));

@@ -77,7 +77,35 @@ if NLP is None:
 NLP.max_length = 2_000_000
 
 KW_MODEL = KeyBERT("all-MiniLM-L6-v2")
-print("  [OK] KeyBERT: all-MiniLM-L6-v2\nReady.\n")
+print("  [OK] KeyBERT: all-MiniLM-L6-v2")
+
+# ── MarkItDown: convert every upload to Markdown before analysis ────────────────
+# https://github.com/microsoft/markitdown — one converter for PDF, Office, HTML,
+# CSV/JSON/XML, images, etc. We feed its Markdown into the existing NLP pipeline
+# so structure (headings, tables, lists) survives into concept/entity extraction.
+try:
+    from markitdown import MarkItDown
+    MARKITDOWN = MarkItDown()
+    print("  [OK] MarkItDown: documents → Markdown")
+except Exception as _md_exc:
+    MARKITDOWN = None
+    print(f"  [!] MarkItDown unavailable ({_md_exc}) — falling back to built-in readers")
+
+# ── GLiNER: zero-shot NER for labels spaCy's fixed schema can't supply ──────────
+# Fills the gaps (job titles, products, events) that PERSON/ORG/GPE miss. Runs
+# locally, deterministic in eval mode. Person/Org/Location stay with spaCy to
+# avoid double-counting in the entity table and knowledge graph.
+GLINER_LABELS = ["job title", "product", "event"]
+GLINER_THRESHOLD = 0.5
+try:
+    from gliner import GLiNER
+    GLINER = GLiNER.from_pretrained("urchade/gliner_small-v2.1")
+    GLINER.eval()
+    print("  [OK] GLiNER: urchade/gliner_small-v2.1 (zero-shot NER)")
+except Exception as _gl_exc:
+    GLINER = None
+    print(f"  [!] GLiNER unavailable ({_gl_exc}) — skipping typed-entity extraction")
+print("Ready.\n")
 
 # ── Patterns ──────────────────────────────────────────────────────────────────
 PROBLEM_WORDS = {
@@ -186,6 +214,42 @@ _SVO_DEPS = {"ROOT", "relcl", "xcomp", "advcl", "conj", "acl", "ccomp", "pcomp"}
 _PERSON_PREFIXES = re.compile(
     r"^(O'|O’|Mc|Mac|De|Di|Van|Von|Le|La|St\.?\s)\w", re.IGNORECASE)
 
+# spaCy NER labels that name proper nouns. In normal prose these are capitalised,
+# so a fully lower-case span (e.g. "tae kwon") tagged as one is almost always a
+# model misfire — we drop those rather than trust the statistical guess.
+_PROPER_LABELS = {"PERSON", "ORG", "GPE", "LOC", "NORP", "FAC", "PRODUCT",
+                  "EVENT", "WORK_OF_ART", "LANGUAGE"}
+
+# spaCy numeric/value labels that aren't useful *named* entities ("four", "first",
+# "23%", "$1.2M"). They're noise in the Entities table and are already captured
+# with higher precision by extract_structured() → the Structured Data tab.
+_NOISE_ENTITY_LABELS = {"CARDINAL", "ORDINAL", "PERCENT", "MONEY", "QUANTITY"}
+
+def _looks_proper(text: str) -> bool:
+    """True if any letter is upper-case — real proper nouns are capitalised
+    somewhere ("John", "iPhone", "eBay"); pure lower-case spans are misfires."""
+    return any(c.isupper() for c in text)
+
+# Pronouns and relativisers must never anchor an SVO triple. As a subject/object
+# they collapse many unrelated sentences onto one meaningless hub ("they", "it",
+# "that", "which") that then dominates the knowledge graph as the biggest node.
+# spaCy tags most as PRON, but relative "that"/"which"/"who" sometimes come back
+# as DET/other — so we also match by lemma.
+_PRONOUN_LEMMAS = {
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+    "myself", "yourself", "himself", "herself", "itself", "ourselves",
+    "yourselves", "themselves", "oneself",
+    "this", "that", "these", "those", "which", "who", "whom", "whose", "what",
+    "someone", "somebody", "something", "anyone", "anybody", "anything",
+    "everyone", "everybody", "everything", "one", "ones", "other", "others",
+    "none", "nobody", "nothing", "each", "either", "neither",
+}
+
+def _is_pronoun(tok) -> bool:
+    """A subject/object token that should never become a graph node — a pronoun
+    or relativiser carrying no entity identity of its own."""
+    return tok.pos_ == "PRON" or tok.lemma_.lower() in _PRONOUN_LEMMAS
+
 _TRIVIAL_CONCEPTS = {
     "one","two","three","four","five","six","seven","eight","nine","ten",
     "first","second","third","fourth","fifth","last","next","new","old",
@@ -224,11 +288,33 @@ def read_text(path: str) -> str:
         except (UnicodeDecodeError, LookupError): pass
     return Path(path).read_bytes().decode("ascii", errors="replace")
 
+# Friendly format labels by extension (for the Files table).
+_FORMAT_LABELS = {
+    ".pdf": "PDF", ".docx": "Word Document", ".doc": "Word Document",
+    ".pptx": "PowerPoint", ".ppt": "PowerPoint",
+    ".xlsx": "Excel", ".xls": "Excel", ".csv": "CSV",
+    ".html": "HTML", ".htm": "HTML", ".json": "JSON", ".xml": "XML",
+    ".epub": "EPUB", ".md": "Markdown", ".markdown": "Markdown",
+}
+
 def read_document(path: str) -> Tuple[str, str]:
     ext = Path(path).suffix.lower()
+    label = _FORMAT_LABELS.get(ext, "Text / ASCII")
+
+    # Primary path: let MarkItDown convert the document to Markdown, then analyse
+    # that. Markdown preserves headings/tables/lists the legacy readers flatten.
+    if MARKITDOWN is not None:
+        try:
+            md = MARKITDOWN.convert(path).text_content
+            if md and md.strip():
+                return md, f"{label} → Markdown"
+        except Exception:
+            pass  # fall through to the built-in extractors below
+
+    # Fallback: the original format-specific readers.
     if ext == ".pdf": return read_pdf(path), "PDF"
     if ext in (".docx", ".doc"): return read_docx(path), "Word Document"
-    return read_text(path), "Text / ASCII"
+    return read_text(path), label
 
 # ── NLP helpers ───────────────────────────────────────────────────────────────
 def chunk_text(text: str, max_chunk: int = 80_000) -> List[str]:
@@ -337,6 +423,13 @@ def parse_document(text: str):
             for ent in sent.ents:
                 t = ent.text.strip(); label = ent.label_
                 if len(t) <= 1: continue
+                # Drop bare numerals/values (CARDINAL "four", PERCENT, MONEY…) —
+                # noise here, and already in the Structured Data tab.
+                if label in _NOISE_ENTITY_LABELS:
+                    continue
+                # Drop lower-case proper-noun misfires (e.g. "tae kwon" → PERSON).
+                if label in _PROPER_LABELS and not _looks_proper(t):
+                    continue
                 if label == "GPE" and (_PERSON_PREFIXES.match(t) or "'" in t):
                     label = "PERSON"
                 ent_counter[(t, label)] += 1
@@ -345,11 +438,14 @@ def parse_document(text: str):
             for tok in sent:
                 if tok.pos_ != "VERB" or tok.dep_ not in _SVO_DEPS: continue
                 verb = tok.lemma_.lower()
-                subjs = [w for w in tok.lefts  if w.dep_ in ("nsubj","nsubjpass","csubj")]
-                objs  = [w for w in tok.rights if w.dep_ in ("dobj","attr","acomp")]
+                subjs = [w for w in tok.lefts  if w.dep_ in ("nsubj","nsubjpass","csubj")
+                         and not _is_pronoun(w)]
+                objs  = [w for w in tok.rights if w.dep_ in ("dobj","attr","acomp")
+                         and not _is_pronoun(w)]
                 for prep in tok.rights:
                     if prep.dep_ == "prep":
-                        objs += [c for c in prep.children if c.dep_ == "pobj"]
+                        objs += [c for c in prep.children
+                                 if c.dep_ == "pobj" and not _is_pronoun(c)]
                 for s in subjs:
                     st = _clean(" ".join(w.text for w in s.subtree
                                          if w.dep_ not in ("det","punct") and len(w.text) > 1))
@@ -530,6 +626,209 @@ def build_entities(ent_counter: Counter, ent_sents: Dict[str, set],
                     "Description": spacy.explain(e["type"]) or e["type"],
                     "Tier": tier, "Importance": e["imp"],
                     "Occurrences": e["count"], "Context": e["desc"]})
+    return out
+
+# ── Structured deterministic extractors (regex + validating libraries) ──────────
+# High-precision, deterministic, offline. Each candidate is validated/normalised
+# by a purpose-built library so a greedy pattern can stay high-recall without
+# bleeding false positives (e.g. phonenumbers validates, tldextract parses hosts).
+import phonenumbers
+import tldextract
+import dateparser
+import validators as _validators
+from quantulum3 import parser as _qparser
+from price_parser import Price as _Price
+
+# Offline TLD parser: bundled Public Suffix List snapshot, never hits the network.
+_TLD = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+
+_EMAIL_RE    = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_URL_RE      = re.compile(r"\b(?:https?://|www\.)[^\s<>()\[\]{}\"']+", re.I)
+_PCT_RE      = re.compile(r"(?<![\w.])\d+(?:\.\d+)?\s?%")
+_HASHTAG_RE  = re.compile(r"(?<!\w)#([A-Za-z]\w{1,49})")
+_HANDLE_RE   = re.compile(r"(?<![\w@./])@([A-Za-z0-9_]{2,30})\b")
+_DOI_RE      = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", re.I)
+_ARXIV_RE    = re.compile(r"\barXiv:\s?\d{4}\.\d{4,5}(?:v\d+)?\b", re.I)
+_ISBN_RE     = re.compile(r"\bISBN(?:-1[03])?:?\s?(?:97[89][- ]?)?(?:\d[- ]?){9}[\dXx]\b")
+_STAT_RE     = re.compile(
+    r"(?:p\s?[<>=]\s?0?\.\d+|\bn\s?=\s?\d{1,9}\b|\br\s?=\s?-?0?\.\d+|"
+    r"95%\s?CI|\bSD\s?=\s?[\d.]+|\bM\s?=\s?[\d.]+|t\s?\(\d+\)\s?=\s?-?[\d.]+)", re.I)
+_CURRENCY_RE = re.compile(
+    r"(?:[$€£¥₹]\s?\d[\d,]*(?:\.\d+)?\s?(?:[KMB]\b|million|billion|thousand)?"
+    r"|\b\d[\d,]*(?:\.\d+)?\s?(?:USD|EUR|GBP|JPY|INR|CAD|AUD)\b)", re.I)
+_DURATION_RE = re.compile(
+    r"\b\d+(?:\.\d+)?[\-\s]?(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|"
+    r"days?|weeks?|months?|years?|milliseconds?)\b", re.I)
+# Acronym definition: "Full Term Here (FTH)" — keep only when initials roughly match.
+_ACRONYM_RE  = re.compile(
+    r"\b((?:[A-Z][A-Za-z0-9]*\W+){1,6}[A-Za-z0-9]+)\s+\(([A-Z][A-Z0-9]{1,6})s?\)")
+_DATE_RE     = re.compile(
+    r"\b(?:\d{4}-\d{2}-\d{2}"                                            # ISO 2024-03-14
+    r"|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"                                    # 03/14/2024
+    r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}"
+    r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}"
+    r"|Q[1-4]\s+\d{4})\b", re.I)
+
+def _ctx(text: str, start: int, end: int, pad: int = 55) -> str:
+    """Short surrounding snippet for a matched span (for the Context column)."""
+    return _clean(text[max(0, start - pad):min(len(text), end + pad)], 140)
+
+def _acronym_phrase(initials: str, phrase: str) -> Optional[str]:
+    """Return the trailing sub-phrase whose word-initials spell `initials` exactly
+    (so 'degrees C. The Service Level Agreement (SLA)' → 'Service Level Agreement')."""
+    words = re.findall(r"[A-Za-z0-9&]+", phrase)
+    k = len(initials)
+    if len(words) < k:
+        return None
+    tail = words[-k:]
+    if "".join(w[0] for w in tail).upper() == initials.upper():
+        return " ".join(tail)
+    return None
+
+_CURR_MULT = [("thousand", 1e3), ("million", 1e6), ("billion", 1e9),
+              ("k", 1e3), ("m", 1e6), ("b", 1e9)]
+
+def _currency_detail(v: str) -> str:
+    """Normalise a currency surface form to '<amount> <symbol>', expanding K/M/B."""
+    p = _Price.fromstring(v)
+    if p.amount is None:
+        return ""
+    amt, low = p.amount_float, v.lower()
+    for sfx, factor in _CURR_MULT:
+        if re.search(rf"\d\s*{sfx}\b", low):
+            amt *= factor
+            break
+    cur = p.currency or ""
+    return (f"{amt:,.0f} {cur}".strip() if amt >= 1000 else f"{amt:g} {cur}".strip())
+
+def extract_structured(text: str) -> List[Dict]:
+    """L2: emails, URLs/domains, phones, dates, durations, measurements, currency,
+    percentages, hashtags, handles, citations, statistics, acronyms — one flat,
+    validated, deduplicated table of {Type, Value, Detail, Context}."""
+    rows: List[Dict] = []
+    seen: set = set()
+
+    def add(typ: str, value: str, detail: str, ctx: str):
+        key = (typ, value.lower().strip(), detail.lower().strip())
+        if value.strip() and key not in seen:
+            seen.add(key)
+            rows.append({"Type": typ, "Value": value.strip(),
+                         "Detail": detail, "Context": ctx})
+
+    # Emails (validated)
+    for m in _EMAIL_RE.finditer(text):
+        v = m.group(0)
+        if _validators.email(v):
+            add("Email", v, v.split("@", 1)[1], _ctx(text, *m.span()))
+
+    # URLs / domains (offline host parse → subdomain.domain.tld)
+    for m in _URL_RE.finditer(text):
+        v = m.group(0).rstrip(".,);:'\"")
+        ex = _TLD(v)
+        if ex.suffix:
+            host = ".".join(p for p in (ex.subdomain, ex.domain, ex.suffix) if p)
+            add("URL", v, host, _ctx(text, *m.span()))
+
+    # Phone numbers (libphonenumber — validated, normalised to E.164)
+    for region in ("US", None):
+        try:
+            for m in phonenumbers.PhoneNumberMatcher(text, region):
+                if phonenumbers.is_valid_number(m.number):
+                    e164 = phonenumbers.format_number(
+                        m.number, phonenumbers.PhoneNumberFormat.E164)
+                    add("Phone", m.raw_string, e164, _ctx(text, m.start, m.end))
+        except Exception:
+            pass
+
+    # Dates (regex find → dateparser normalise to ISO)
+    for m in _DATE_RE.finditer(text):
+        v = m.group(0)
+        try:
+            dt = dateparser.parse(v)
+        except Exception:
+            dt = None
+        add("Date", v, dt.strftime("%Y-%m-%d") if dt else "", _ctx(text, *m.span()))
+
+    # Durations
+    for m in _DURATION_RE.finditer(text):
+        add("Duration", m.group(0), "", _ctx(text, *m.span()))
+
+    # Measurements / quantities (quantulum3 — unit-bearing only; drop bare numbers)
+    try:
+        for q in _qparser.parse(text):
+            unit = q.unit.name
+            if unit and unit != "dimensionless":
+                add("Measurement", q.surface, f"{q.value} {unit}", "")
+    except Exception:
+        pass
+
+    # Currency (regex find → price-parser normalise amount + currency, expand K/M/B)
+    for m in _CURRENCY_RE.finditer(text):
+        v = m.group(0)
+        add("Currency", v, _currency_detail(v), _ctx(text, *m.span()))
+
+    # Percentages
+    for m in _PCT_RE.finditer(text):
+        add("Percentage", m.group(0).replace(" ", ""), "", _ctx(text, *m.span()))
+
+    # Hashtags / social handles
+    for m in _HASHTAG_RE.finditer(text):
+        add("Hashtag", "#" + m.group(1), "", _ctx(text, *m.span()))
+    for m in _HANDLE_RE.finditer(text):
+        add("Social Handle", "@" + m.group(1), "", _ctx(text, *m.span()))
+
+    # Citations (DOI / arXiv / ISBN)
+    for rx, lbl in ((_DOI_RE, "DOI"), (_ARXIV_RE, "arXiv"), (_ISBN_RE, "ISBN")):
+        for m in rx.finditer(text):
+            add("Citation", m.group(0), lbl, _ctx(text, *m.span()))
+
+    # Statistics (p-values, n=, r=, CI, SD, M, t-tests)
+    for m in _STAT_RE.finditer(text):
+        add("Statistic", m.group(0), "", _ctx(text, *m.span()))
+
+    # Acronyms + expansion (Schwartz-Hearst-style, initials must trace the phrase)
+    for m in _ACRONYM_RE.finditer(text):
+        exp = _acronym_phrase(m.group(2), m.group(1))
+        if exp:
+            add("Acronym", m.group(2), exp, _ctx(text, *m.span()))
+
+    type_order = {t: i for i, t in enumerate(
+        ["Email", "Phone", "URL", "Social Handle", "Hashtag", "Date", "Duration",
+         "Measurement", "Currency", "Percentage", "Statistic", "Citation",
+         "Acronym"])}
+    rows.sort(key=lambda r: (type_order.get(r["Type"], 99), r["Value"].lower()))
+    return rows
+
+# ── Zero-shot typed entities (GLiNER) ───────────────────────────────────────────
+def extract_typed_entities(text: str) -> List[Dict]:
+    """L4: GLiNER zero-shot NER for GLINER_LABELS (job title / product / event).
+    Chunked + batched; deduplicated; keeps the highest-confidence hit per entity."""
+    if GLINER is None:
+        return []
+    chunks = chunk_text(text, 1_200)            # GLiNER prefers short windows
+    best: Dict[Tuple[str, str], Dict] = {}
+    try:
+        preds = GLINER.batch_predict_entities(
+            chunks, GLINER_LABELS, threshold=GLINER_THRESHOLD)
+    except Exception:
+        preds = []
+        for c in chunks:
+            try: preds.append(GLINER.predict_entities(c, GLINER_LABELS,
+                                                      threshold=GLINER_THRESHOLD))
+            except Exception: preds.append([])
+    for chunk, ents in zip(chunks, preds):
+        for e in ents:
+            name = _clean(e["text"], 80)
+            if len(name) < 2:
+                continue
+            key = (name.lower(), e["label"])
+            score = round(float(e["score"]), 3)
+            if key not in best or score > best[key]["Confidence"]:
+                s, en = e.get("start", 0), e.get("end", 0)
+                best[key] = {"Entity": name, "Label": e["label"], "Confidence": score,
+                             "Context": _ctx(chunk, s, en)}
+    out = list(best.values())
+    out.sort(key=lambda r: (r["Label"], -r["Confidence"]))
     return out
 
 # ── Variables (regex) ───────────────────────────────────────────────────────────
@@ -768,6 +1067,98 @@ def identify_problems(rels: List[Dict], entities: List[Dict], text: str,
     problems.sort(key=lambda p: sev_rank.get(p["Severity"], 9))
     return problems
 
+# ── Knowledge-graph connectivity helpers (entity standardisation + inference) ────
+# Relations that are logically transitive (A r B ∧ B r C ⇒ A r C). Restricting
+# inference to these keeps inferred edges sound (unlike e.g. "prevents"). Maps
+# both SVO verb-lemma forms ("depend") and causal-phrase forms ("depends on") to
+# one canonical label so a chain spanning both still chains.
+_TRANSITIVE_RELS = {
+    "depend": "depends on", "depends": "depends on", "depends on": "depends on",
+    "require": "requires", "requires": "requires",
+    "need": "needs", "needs": "needs",
+    "contain": "contains", "contains": "contains",
+    "include": "contains", "includes": "contains",
+    "part of": "part of",
+    "lead to": "leads to", "leads to": "leads to",
+    "result in": "results in", "results in": "results in",
+    "cause": "causes", "causes": "causes",
+}
+
+def _standardize_nodes(keys: List[str], sim_threshold: float = 0.85) -> Dict[str, str]:
+    """Merge synonymous / variant node keys into one canonical key so the graph
+    stops fragmenting on surface form ("apple" vs "apple inc", "neural network"
+    vs "neural net"). Uses KeyBERT's embedder (cosine) + whole-word subset.
+    Deterministic and offline. Returns {key: canonical_key}."""
+    uniq = sorted({k for k in keys if k})
+    if len(uniq) < 2:
+        return {k: k for k in uniq}
+    freq = Counter(keys)
+    sim = cosine_similarity(_embed(uniq))
+    parent = list(range(len(uniq)))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]; i = parent[i]
+        return i
+    toks = [set(u.split()) for u in uniq]
+    for i in range(len(uniq)):
+        for j in range(i + 1, len(uniq)):
+            subset = toks[i] and toks[j] and (toks[i] <= toks[j] or toks[j] <= toks[i])
+            if sim[i][j] >= sim_threshold or subset:
+                parent[find(i)] = find(j)
+    groups: Dict[int, List[str]] = defaultdict(list)
+    for i in range(len(uniq)):
+        groups[find(i)].append(uniq[i])
+    cmap: Dict[str, str] = {}
+    for members in groups.values():                    # canonical = most frequent
+        rep = sorted(members, key=lambda k: (-freq[k], -len(k), k))[0]
+        for m in members:
+            cmap[m] = rep
+    return cmap
+
+def _infer_relationships(G: nx.DiGraph, emb_of: Dict[str, np.ndarray],
+                         max_transitive: int = 40, sim_threshold: float = 0.55) -> int:
+    """Densify the graph without an LLM: (1) transitive closure over transitive-
+    safe relations, (2) bridge disconnected components by embedding similarity.
+    Mutates G (adds edges flagged inferred=True). Returns count of edges added."""
+    added = 0
+    # (1) transitive: A —r→ B —r→ C  ⇒  A —r→ C  (same canonical transitive-safe relation)
+    for a in sorted(G.nodes()):
+        for b in sorted(G.successors(a)):
+            rel = _TRANSITIVE_RELS.get((G[a][b].get("label") or "").lower())
+            if rel is None:
+                continue
+            for c in sorted(G.successors(b)):
+                if c == a or G.has_edge(a, c): continue
+                if _TRANSITIVE_RELS.get((G[b][c].get("label") or "").lower()) != rel: continue
+                G.add_edge(a, c, label=rel, rtype="inferred (transitive)",
+                           sentence=f"Inferred: {a} {rel} {b}, {b} {rel} {c}",
+                           problem=False, weight=1, inferred=True)
+                added += 1
+                if added >= max_transitive: break
+            if added >= max_transitive: break
+        if added >= max_transitive: break
+
+    # (2) bridge components: attach each satellite component to the main one via
+    #     its single most-similar node pair (single-linkage across components).
+    comps = sorted(nx.connected_components(G.to_undirected()), key=len, reverse=True)
+    if len(comps) > 1:
+        main = [n for n in comps[0] if n in emb_of]
+        for comp in comps[1:]:
+            best = None
+            for n in (x for x in comp if x in emb_of):
+                for m in main:
+                    s = float(cosine_similarity([emb_of[n]], [emb_of[m]])[0][0])
+                    if best is None or s > best[0]:
+                        best = (s, n, m)
+            if best and best[0] >= sim_threshold:
+                _, n, m = best
+                G.add_edge(n, m, label="related to", rtype="inferred (similarity)",
+                           sentence=f"Inferred link (cosine {best[0]:.2f})",
+                           problem=False, weight=1, inferred=True)
+                main.extend(x for x in comp if x in emb_of)   # allow later chaining
+                added += 1
+    return added
+
 # ── Knowledge graph (influence / betweenness / key nodes) ───────────────────────
 def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
                           problems: List[Dict], concepts: List[Dict],
@@ -777,27 +1168,51 @@ def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
         k = e["Entity"].lower()
         if k not in ent_type:
             ent_type[k] = e["Type"]; ent_count[k] = e.get("Occurrences", 1)
-    concept_set = {c["Concept"].lower() for c in concepts if c.get("Concept")}
-    problem_pairs = {(p["Subject"].lower()[:40], p["Object"].lower()[:40]) for p in problems}
+
+    # 1 ── canonical surfaces (strip leading articles) → merge synonyms/variants
+    triples: List[Tuple[str, str, Dict]] = []
+    surface_of: Dict[str, str] = {}
+    for r in rels:
+        ss = _node_label(r.get("Subject", ""), 40); oo = _node_label(r.get("Object", ""), 40)
+        s, o = ss.lower(), oo.lower()
+        if not s or not o or s == o: continue
+        triples.append((s, o, r))
+        surface_of.setdefault(s, ss); surface_of.setdefault(o, oo)
+    if not triples:
+        return {"nodes": [], "edges": [],
+                "stats": {"nodes": 0, "edges": 0, "communities": 0, "inferred_edges": 0}}
+
+    cmap = _standardize_nodes([t[0] for t in triples] + [t[1] for t in triples])
+    def canon(label: str) -> str:
+        k = _node_label(label, 40).lower()
+        return cmap.get(k, k)
+    problem_pairs = {(canon(p["Subject"]), canon(p["Object"])) for p in problems}
 
     G = nx.DiGraph()
-    for r in rels:
-        s = _clean(r.get("Subject", ""), 40); o = _clean(r.get("Object", ""), 40)
-        if not s or not o or s.lower() == o.lower(): continue
-        sk, ok = s.lower(), o.lower()
-        for nk, label in ((sk, s), (ok, o)):
+    for s, o, r in triples:
+        sk, ok = cmap.get(s, s), cmap.get(o, o)
+        if sk == ok: continue
+        for nk in (sk, ok):
             if G.has_node(nk): G.nodes[nk]["weight"] += 1
-            else: G.add_node(nk, label=label, etype=ent_type.get(nk, ""),
-                             weight=max(ent_count.get(nk, 1), 1))
+            else: G.add_node(nk, label=surface_of.get(nk, nk),
+                             etype=ent_type.get(nk, ""), weight=max(ent_count.get(nk, 1), 1))
         if G.has_edge(sk, ok): G[sk][ok]["weight"] += 1
         else: G.add_edge(sk, ok, label=r.get("Relationship", ""),
                          rtype=r.get("Rel. Type", ""),
                          sentence=_clean(r.get("Source Sentence", ""), 200),
-                         problem=(sk[:40], ok[:40]) in problem_pairs, weight=1)
+                         problem=(sk, ok) in problem_pairs, weight=1, inferred=False)
 
     if G.number_of_nodes() > max_nodes:
         keep = [n for n, _ in sorted(G.degree, key=lambda x: -x[1])[:max_nodes]]
         G = G.subgraph(keep).copy()
+
+    # 2 ── relationship inference (transitive + similarity bridging) to densify
+    inferred = 0
+    if G.number_of_nodes() > 2:
+        node_keys = sorted(G.nodes())
+        vecs = _embed([surface_of.get(n, n) for n in node_keys])
+        emb_of = {n: vecs[i] for i, n in enumerate(node_keys)}
+        inferred = _infer_relationships(G, emb_of)
     G.remove_nodes_from(list(nx.isolates(G)))
 
     comm_of: Dict[str, int] = {}
@@ -827,7 +1242,7 @@ def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
              for n, d in G.nodes(data=True)]
     edges = [{"from": u, "to": v, "label": d.get("label", ""), "rtype": d.get("rtype", ""),
               "sentence": d.get("sentence", ""), "problem": bool(d.get("problem")),
-              "weight": d.get("weight", 1)}
+              "inferred": bool(d.get("inferred")), "weight": d.get("weight", 1)}
              for u, v, d in G.edges(data=True)]
 
     key: Dict[str, str] = {}
@@ -838,7 +1253,8 @@ def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
             key["bridge"] = max(nodes, key=lambda n: n["betweenness"])["label"]
     return {"nodes": nodes, "edges": edges,
             "stats": {"nodes": len(nodes), "edges": len(edges),
-                      "communities": len(set(comm_of.values())) if comm_of else 0, **key}}
+                      "communities": len(set(comm_of.values())) if comm_of else 0,
+                      "inferred_edges": inferred, **key}}
 
 # ── Executive intelligence roll-up ──────────────────────────────────────────────
 def build_executive_insights(entities, concepts, variables, problems, rels,
@@ -890,6 +1306,38 @@ def build_executive_insights(entities, concepts, variables, problems, rels,
         add("Strategic Insight", "No critical problems or contradictions — content is internally consistent")
     return ins
 
+def _structured_insights(structured: List[Dict], typed: List[Dict]) -> List[Dict]:
+    """Fold the deterministic L2 / typed-entity findings into the insight roll-up."""
+    ins: List[Dict] = []
+    by_type: Dict[str, list] = defaultdict(list)
+    for r in structured:
+        by_type[r["Type"]].append(r["Value"])
+    by_label: Dict[str, list] = defaultdict(list)
+    for r in typed:
+        by_label[r["Label"]].append(r["Entity"])
+
+    def add(cat, finding): ins.append({"Category": cat, "Finding": _clean(str(finding), 300)})
+
+    contacts = len(by_type.get("Email", [])) + len(by_type.get("Phone", []))
+    if contacts:
+        sample = (by_type.get("Email") or by_type.get("Phone"))[0]
+        add("Contact Points", f"{contacts} contact(s) detected (e.g. {sample})")
+    if by_type.get("Currency"):
+        add("Financial Figures",
+            f'{len(by_type["Currency"])} monetary amounts (e.g. {by_type["Currency"][0]})')
+    if by_type.get("Statistic"):
+        add("Statistical Evidence",
+            f'{len(by_type["Statistic"])} statistics reported (e.g. {by_type["Statistic"][0]})')
+    if by_type.get("Date"):
+        add("Temporal Span", f'{len(by_type["Date"])} dates referenced')
+    if by_type.get("Acronym"):
+        add("Terminology", f'{len(by_type["Acronym"])} acronyms defined in-text')
+    for label in ("job title", "product", "event"):
+        if by_label.get(label):
+            add(f"Typed Entities — {label.title()}",
+                f'{len(by_label[label])} found (e.g. {by_label[label][0]})')
+    return ins
+
 # ── Export helpers ────────────────────────────────────────────────────────────
 def _export_excel_bytes(results: Dict) -> bytes:
     wb = Workbook()
@@ -921,6 +1369,8 @@ def _export_excel_bytes(results: Dict) -> bytes:
 
     ws("Files",                  results["files"])
     ws("Entities",               results["entities"])
+    ws("Typed Entities",         results["typed_entities"])
+    ws("Structured Data",        results["structured"])
     ws("Key Concepts",           results["concepts"])
     ws("Variables",              results["variables"])
     ws("Relationships",          results["relationships"])
@@ -944,7 +1394,8 @@ def _export_excel_bytes(results: Dict) -> bytes:
 def _export_csv_bytes(results: Dict) -> bytes:
     buf = io.BytesIO()
     sheets = {"summary": [results["summary"]], "files": results["files"],
-              "entities": results["entities"], "concepts": results["concepts"],
+              "entities": results["entities"], "typed_entities": results["typed_entities"],
+              "structured": results["structured"], "concepts": results["concepts"],
               "variables": results["variables"], "relationships": results["relationships"],
               "dependencies": results["dependencies"], "causal_chains": results["causal_chains"],
               "problems": results["problems"], "contradictions": results["contradictions"],
@@ -974,6 +1425,8 @@ def _export_markdown_bytes(results: Dict) -> bytes:
     out += section("Executive Insights",     results["insights"])
     out += section("Files Analyzed",         results["files"])
     out += section("Named Entities",         results["entities"])
+    out += section("Typed Entities",         results["typed_entities"])
+    out += section("Structured Data",        results["structured"])
     out += section("Key Concepts",           results["concepts"])
     out += section("Variables",              results["variables"])
     out += section("Relationships",          results["relationships"])
@@ -1026,11 +1479,13 @@ def analyze():
     if len(combined) > 400_000:
         combined = combined[:400_000]
 
-    # Preprocessing → single spaCy pass → KeyBERT reasoning layer → analyses.
+    # Preprocessing → deterministic L2 → single spaCy pass → KeyBERT + GLiNER → analyses.
     combined        = preprocess_text(combined)
+    structured      = extract_structured(combined)
     sents, ent_counter, ent_sents, svo = parse_document(combined)
     concepts        = extract_concepts(combined, sents, ent_sents)
     entities        = build_entities(ent_counter, ent_sents, sents, concepts)
+    typed_entities  = extract_typed_entities(combined)
     variables       = extract_variables(combined)
     causal          = extract_causal(combined)
     all_rels        = svo + causal
@@ -1044,10 +1499,12 @@ def analyze():
     insights        = build_executive_insights(entities, concepts, variables, problems,
                                                 all_rels, dependencies, causal_chains,
                                                 contradictions, assumptions, graph)
+    insights       += _structured_insights(structured, typed_entities)
 
     sid = str(uuid.uuid4())
     results = {
-        "files": records, "entities": entities, "concepts": concepts,
+        "files": records, "entities": entities, "typed_entities": typed_entities,
+        "concepts": concepts, "structured": structured,
         "variables": variables, "relationships": rels_display, "problems": problems,
         "dependencies": dependencies, "causal_chains": causal_chains,
         "contradictions": contradictions, "assumptions": assumptions,
@@ -1056,6 +1513,8 @@ def analyze():
             "Files Analyzed":       len(records),
             "Total Words":          f"{sum(r.get('Words', 0) for r in records):,}",
             "Entities Found":       len(entities),
+            "Typed Entities":       len(typed_entities),
+            "Structured Data":      len(structured),
             "Key Concepts":         len(concepts),
             "Variables Detected":   len(variables),
             "Relationships Mapped": len(rels_display),
@@ -1068,6 +1527,7 @@ def analyze():
             "Graph Edges":          graph["stats"]["edges"],
             "NLP Model":            NLP_MODEL,
             "Concept Model":        "all-MiniLM-L6-v2 (KeyBERT)",
+            "Typed-Entity Model":   "gliner_small-v2.1" if GLINER else "unavailable",
         },
     }
     _RESULTS[sid] = results
@@ -1119,4 +1579,4 @@ if __name__ == "__main__":
     print(f"Data Analyzer Web running at:")
     print(f"  This computer : {url}")
     print(f"  On your WiFi  : http://{lan}:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False, threaded=True)
