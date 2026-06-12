@@ -1176,6 +1176,10 @@ def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
         ss = _node_label(r.get("Subject", ""), 40); oo = _node_label(r.get("Object", ""), 40)
         s, o = ss.lower(), oo.lower()
         if not s or not o or s == o: continue
+        # Central guard: a bare pronoun/relativiser must never become a node,
+        # whatever extractor produced it (SVO, causal, …). Keeps "they"/"it"/
+        # "that" from collapsing many sentences onto one meaningless hub.
+        if s in _PRONOUN_LEMMAS or o in _PRONOUN_LEMMAS: continue
         triples.append((s, o, r))
         surface_of.setdefault(s, ss); surface_of.setdefault(o, oo)
     if not triples:
