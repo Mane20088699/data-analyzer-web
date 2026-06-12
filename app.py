@@ -250,6 +250,11 @@ def _is_pronoun(tok) -> bool:
     or relativiser carrying no entity identity of its own."""
     return tok.pos_ == "PRON" or tok.lemma_.lower() in _PRONOUN_LEMMAS
 
+def _word_set(text: str) -> set:
+    """Lower-case alphabetic word tokens of a string, for whole-word keyword
+    matching (so "issue" never matches inside "tissue")."""
+    return set(re.findall(r"[a-z]+", text.lower()))
+
 _TRIVIAL_CONCEPTS = {
     "one","two","three","four","five","six","seven","eight","nine","ten",
     "first","second","third","fourth","fifth","last","next","new","old",
@@ -1036,16 +1041,19 @@ def identify_problems(rels: List[Dict], entities: List[Dict], text: str,
         s = r.get("Subject", "").lower(); rel = r.get("Relationship", "").lower()
         o = r.get("Object", "").lower(); src = r.get("Source Sentence", "")
         srcl = src.lower()
+        # Match on whole words, not substrings — otherwise "issue" fires inside
+        # "tissue" and "exploit" inside "exploitation", flagging ordinary prose
+        # as Critical security risks. Keyword sets are all single words.
+        src_w = _word_set(srcl); rel_w = _word_set(rel)
+        triple_w = rel_w | _word_set(s) | _word_set(o)
 
-        if any(w in srcl for w in SECURITY_WORDS) or \
-           any(w in rel or w in s or w in o for w in SECURITY_WORDS):
+        if (SECURITY_WORDS & src_w) or (SECURITY_WORDS & triple_w):
             sev, ptype = "Critical", "security / safety risk"
-        elif any(w in rel for w in PROBLEM_WORDS) or any(w in s for w in PROBLEM_WORDS) \
-                or any(w in o for w in PROBLEM_WORDS):
+        elif PROBLEM_WORDS & triple_w:
             sev, ptype = "High", "problem keyword"
         elif s[:40] in cycle_nodes or o[:40] in cycle_nodes:
             sev, ptype = "Medium", "circular dependency"
-        elif any(w in srcl for w in PROBLEM_WORDS):
+        elif PROBLEM_WORDS & src_w:
             sev, ptype = "Low", "problematic context"
         else:
             continue
