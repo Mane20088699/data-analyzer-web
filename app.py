@@ -28,10 +28,15 @@ def _patched_req(self, *a, **kw): kw.setdefault("verify", False); return _orig_r
 _req.Session.request = _patched_req
 
 # ── Standard imports ──────────────────────────────────────────────────────────
-import os, re, sys, json, uuid, random, warnings, tempfile, zipfile, io
+import os, re, sys, json, uuid, random, warnings, tempfile, zipfile, io, unicodedata
 from pathlib import Path
 from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Optional
+
+try:
+    import ftfy
+except Exception:
+    ftfy = None
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -392,8 +397,17 @@ def _tail_windows(text: str, head: int = 60_000, size: int = 20_000,
     seg = text[head:head + size * max_windows]
     return [seg[i:i + size] for i in range(0, len(seg), size)]
 
+def normalize_unicode(text: str) -> str:
+    """Repair encoding damage and decompose typographic ligatures.
+    ftfy fixes mojibake (CÃ´tÃ© → Côté); NFKC maps ligatures (ﬁ→fi, ﬂ→fl)
+    that ftfy's NFC pass leaves intact."""
+    if ftfy is not None:
+        text = ftfy.fix_text(text)
+    return unicodedata.normalize("NFKC", text)
+
 def preprocess_text(text: str) -> str:
     """Normalise text before it reaches KeyBERT/spaCy (the 'preprocessing' layer)."""
+    text = normalize_unicode(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"-\n(?=[a-z])", "", text)                 # de-hyphenate wraps
     lines = [l.rstrip() for l in text.split("\n")]
