@@ -123,9 +123,12 @@ PROBLEM_WORDS = {
     "deprecated","obsolete","flaw","weakness",
 }
 
-# Subset of PROBLEM_WORDS that escalate a finding to Critical severity.
+# Subset of PROBLEM_WORDS that escalate a finding to Critical severity. "exploit"
+# is intentionally absent: as a verb it is overwhelmingly benign ("exploit a
+# niche/resource/opportunity"), and the security sense is carried reliably by the
+# others ("breach", "malware", "unauthorized", "vulnerability").
 SECURITY_WORDS = {
-    "vulnerability","vulnerable","breach","exploit","unsafe","hazard","leak",
+    "vulnerability","vulnerable","breach","unsafe","hazard","leak",
     "deadlock","overflow","unauthorized","malware","attack","compromise","violation",
 }
 
@@ -229,6 +232,33 @@ _PROPER_LABELS = {"PERSON", "ORG", "GPE", "LOC", "NORP", "FAC", "PRODUCT",
 # "23%", "$1.2M"). They're noise in the Entities table and are already captured
 # with higher precision by extract_structured() → the Structured Data tab.
 _NOISE_ENTITY_LABELS = {"CARDINAL", "ORDINAL", "PERCENT", "MONEY", "QUANTITY"}
+
+# Citation-style DATE spans that swamp the entity table on academic PDFs: bare
+# years ("1998"), year+suffix ("1991a"), year lists ("1998, 2003"), and journal
+# vol:page locators ("3:613-31", "44:487"). Descriptive dates ("July 26, 2004",
+# "100 years old", "three-year") don't match and are kept.
+_NOISE_DATE_RE = re.compile(
+    r"^(?:(?:19|20)\d{2}[a-z]?(?:[,;/&\s]+(?:19|20)?\d{1,4}[a-z]?)*"
+    r"|\d{1,4}\s*:\s*\d{1,4}.*"
+    r"|[\d.,;:/&\s\-–]+)$")
+
+# Journal / publisher / citation abbreviations that NER mistakes for PERSON/ORG/GPE
+# ("Ecol.", "Evol.", "Univ.", "Annu."). Most arrive via the bibliography; this is
+# defence-in-depth for any that leak into the body via running heads.
+_ENTITY_STOPWORDS = {
+    "ecol", "evol", "biol", "syst", "annu", "rev", "univ", "herpetol", "zool",
+    "sci", "nat", "conserv", "proc", "soc", "inst", "dep", "div", "natl", "acad",
+    "ed", "eds", "vol", "pp", "fig", "no", "et al", "limnol", "oceanogr", "midl",
+    "freshw", "copeia", "oikos", "ecosys", "geogr", "behav", "entomol", "pac",
+    "gtr", "cv", "phd", "doi", "isbn",
+}
+
+def _is_noise_date(t: str) -> bool:
+    return bool(_NOISE_DATE_RE.match(t.strip()))
+
+def _is_stopword_entity(t: str) -> bool:
+    low = re.sub(r"[.\s]+$", "", t.strip().lower())
+    return low in _ENTITY_STOPWORDS
 
 def _looks_proper(text: str) -> bool:
     """True if any letter is upper-case — real proper nouns are capitalised
@@ -405,11 +435,66 @@ def normalize_unicode(text: str) -> str:
         text = ftfy.fix_text(text)
     return unicodedata.normalize("NFKC", text)
 
+# Reference/bibliography section headings. Specific phrases match case-insensitively
+# (rare in prose); bare "REFERENCES" only in its uppercase heading form so a
+# sentence like "see references above" doesn't trip it. PDF extraction often
+# flattens the heading inline, so this is intentionally not line-anchored.
+_REFERENCES_RE = re.compile(
+    r"(?i:literature\s+cited|works\s+cited|bibliography|references\s+cited)"
+    r"|\bREFERENCES\b")
+
+def strip_references(text: str) -> str:
+    """Drop a trailing references/bibliography section so cited-author names and
+    journal abbreviations ('Ecol', 'Welsh HH') don't swamp entity/relationship
+    extraction. Only cuts at a heading in the back half of the document, so a doc
+    that merely mentions 'references' up front is left intact."""
+    for m in _REFERENCES_RE.finditer(text):
+        if m.start() >= len(text) * 0.5:
+            return text[:m.start()].rstrip()
+    return text
+
+# Recurring PDF page furniture (download stamps, running heads, timestamps). These
+# survive line-based de-boilerplating because markitdown flattens them inline, so
+# we scrub them with substitutions on the whole text.
+_PAGE_FURNITURE = [
+    re.compile(r"Downloaded from\s+[^\s]+\.org\S*", re.I),
+    re.compile(r"\bby\s+[A-Z][^\n]{0,60}?\s+on\s+\d{1,2}/\d{1,2}/\d{2,4}\b"),
+    re.compile(r"\bFor personal use only\.?", re.I),
+    re.compile(r"\b\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}\s+\d{1,2}:\d{2}(?:\s+\d{1,4})?\b"),
+    re.compile(r"\b[A-Z][a-z]{2,5}\.\s+Rev\.[^\n]{0,50}?\d{4}\.\d+:\d+[-–]\d+"),
+    re.compile(r"\b\d{4}\.\d+:\d+[-–]\d+\b"),
+]
+
+def strip_page_furniture(text: str) -> str:
+    for rx in _PAGE_FURNITURE:
+        text = rx.sub(" ", text)
+    return text
+
+_MD_TABLE_SEP = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$")
+
+def flatten_md_tables(text: str) -> str:
+    """Turn markdown/extracted table rows into short sentences. Otherwise a whole
+    pipe-delimited table flows into one sentence and becomes a giant SVO subject
+    (e.g. 'Kingdom Animalia Phylum Chordata … evolve early tetrapods')."""
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if _MD_TABLE_SEP.match(s):
+            continue                                    # divider row → drop
+        if s.startswith("|") and s.count("|") >= 2:
+            cells = [c.strip() for c in s.strip("|").split("|") if c.strip()]
+            out.append("; ".join(cells) + "." if cells else "")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
 def preprocess_text(text: str) -> str:
     """Normalise text before it reaches KeyBERT/spaCy (the 'preprocessing' layer)."""
     text = normalize_unicode(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"-\n(?=[a-z])", "", text)                 # de-hyphenate wraps
+    text = strip_page_furniture(text)
+    text = flatten_md_tables(text)
     lines = [l.rstrip() for l in text.split("\n")]
     # Drop repeated page headers/footers (same short line appearing many times).
     freq = Counter(l.strip() for l in lines if 0 < len(l.strip()) <= 60)
@@ -445,6 +530,12 @@ def parse_document(text: str):
                 # Drop bare numerals/values (CARDINAL "four", PERCENT, MONEY…) —
                 # noise here, and already in the Structured Data tab.
                 if label in _NOISE_ENTITY_LABELS:
+                    continue
+                # Drop citation-year DATE noise ("1998", "1991a", "3:613-31").
+                if label == "DATE" and _is_noise_date(t):
+                    continue
+                # Drop journal/citation abbreviations NER reads as names ("Ecol.").
+                if _is_stopword_entity(t):
                     continue
                 # Drop lower-case proper-noun misfires (e.g. "tae kwon" → PERSON).
                 if label in _PROPER_LABELS and not _looks_proper(t):
@@ -1489,9 +1580,11 @@ def analyze():
                 tmp_path = tmp.name
                 f.save(tmp_path)
             text, ftype = read_document(tmp_path)
-            texts.append(text)
+            # Counts describe the file as delivered; analysis runs on the body with
+            # any trailing bibliography removed so it isn't mined as content.
             records.append({"Filename": name, "Format": ftype,
                              "Words": len(text.split()), "Characters": len(text), "Status": "OK"})
+            texts.append(strip_references(text))
         except Exception as exc:
             records.append({"Filename": name, "Format": "?",
                              "Words": 0, "Characters": 0, "Status": f"Error: {exc}"})
