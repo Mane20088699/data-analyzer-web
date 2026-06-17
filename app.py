@@ -214,7 +214,7 @@ VARIABLE_PATTERNS: List[Tuple[str, str]] = [
      r"|pressure|voltage|frequency|duration|weight|height|width|length)"
      r"\s+(?:of\s+[\w\s]{1,20}\s+)?(?:is\s+)?([\d.]+\s*(?:[a-zA-Z%°/]+)?)", "parameter"),
     (r"\b([\d.]+)\s*(percent|%|degrees?|ms|milliseconds?|seconds?|minutes?"
-     r"|hours?|days?|meters?|km|kg|lb|MB|GB|TB|KB|RPM|fps|Hz|kHz|MHz|V|A|W)\b", "measurement"),
+     r"|hours?|days?|meters?|km|kg|lb|MB|GB|TB|KB|RPM|fps|Hz|kHz|MHz)\b", "measurement"),
 ]
 
 _SVO_DEPS = {"ROOT", "relcl", "xcomp", "advcl", "conj", "acl", "ccomp", "pcomp"}
@@ -948,6 +948,10 @@ def extract_typed_entities(text: str) -> List[Dict]:
     return out
 
 # ── Variables (regex) ───────────────────────────────────────────────────────────
+# Variable "names" that are really citation/reference tokens, not parameters.
+_VAR_NAME_STOP = {"doi", "isbn", "fig", "figure", "table", "eq", "ref", "no",
+                  "vol", "pp", "al", "et", "ed", "p"}
+
 def extract_variables(text: str) -> List[Dict]:
     results, seen = [], set()
     for sent in sent_tokenize(text):
@@ -957,6 +961,12 @@ def extract_variables(text: str) -> List[Dict]:
                     g = m.groups()
                     name, val = (g[0].strip(), g[1].strip()) if len(g) >= 2 else (None, None)
                     if not name or not val or len(name) < 2: continue
+                    # Drop citation noise: ref tokens ("doi:10.1146") and bare
+                    # years used as names ("1991a"). (val may legitimately be a
+                    # bare unit like "kg" for the measurement pattern.)
+                    if name.lower().rstrip(".") in _VAR_NAME_STOP: continue
+                    if re.fullmatch(r"(?:19|20)\d{2}[a-z]?", name): continue
+                    if re.fullmatch(r"[A-Za-z]", val): continue
                     key = (name.lower()[:30], val[:20])
                     if key not in seen:
                         seen.add(key)
@@ -966,15 +976,80 @@ def extract_variables(text: str) -> List[Dict]:
     return results
 
 # ── Causal / relational regex extraction (with confidence) ──────────────────────
+# Filler stripped from the ends of a regex-captured causal argument, and clause
+# verbs whose presence means the regex spilled across a clause boundary (so the
+# argument is a fragment like "modifications are cited most often as the", not a
+# noun phrase). Such captures are dropped rather than shown.
+_CAUSAL_LEAD = {
+    "the","a","an","and","but","or","nor","so","then","thus","for","as","of","to",
+    "in","on","with","that","which","this","these","those","is","are","was","were",
+    "be","been","being","has","have","had","do","does","did","can","could","would",
+    "should","may","might","will","also","now","well","both","most","often","more",
+    "less","very","much","such","its","their","our","your","his","her","it","they",
+    "we","by","at","from","about","than","because","when","while","where",
+}
+_CAUSAL_TRAIL = {
+    "the","a","an","and","but","or","nor","for","as","of","to","in","on","with",
+    "that","which","by","at","from","about","most","often","more","less","such",
+    "is","are","was","were","than","because","when","while","where","this",
+    "could","would","should","can","may","might","will","must","shall",
+}
+_CAUSAL_FRAG = re.compile(
+    r"\b(?:are|is|was|were|been|being|has|have|had|do|does|did|cited|reported|"
+    r"suggested|concluded|noted|argued|found|shown|recommended|considered|known)\b")
+
+def _causal_arg(text: str) -> Optional[str]:
+    """Trim a regex-captured causal argument to a clean noun-phrase span, or
+    return None if it is a clause fragment (and should be discarded)."""
+    toks = re.findall(r"[A-Za-z][\w-]*|\d+", text)
+    while toks and toks[0].lower() in _CAUSAL_LEAD:  toks.pop(0)
+    while toks and toks[-1].lower() in _CAUSAL_TRAIL: toks.pop()
+    if not toks:
+        return None
+    arg = " ".join(toks)
+    if _CAUSAL_FRAG.search(arg.lower()):
+        return None
+    if len(arg) < 3 or not any(len(t) >= 3 and t.isalpha() for t in toks):
+        return None
+    return arg
+
+# Verb lemmas (from the clean spaCy SVO pass) that express causation. These give
+# high-quality causal pairs to complement the noisier regex extractor.
+_SVO_CAUSAL = {
+    "cause": "causes", "result": "results in", "trigger": "triggers",
+    "drive": "causes", "reduce": "reduces", "increase": "increases",
+    "decrease": "decreases", "prevent": "prevents", "enhance": "enhances",
+    "dampen": "dampens", "slow": "slows", "promote": "promotes",
+    "alter": "alters", "regulate": "regulates",
+}
+
+def _svo_causal(svo: List[Dict]) -> List[Dict]:
+    """Derive causal relations from the clean SVO triples (noun-phrase subjects
+    and objects), avoiding the regex extractor's fragment problem."""
+    out = []
+    for r in svo:
+        lab = _SVO_CAUSAL.get(r.get("Relationship", "").lower())
+        if not lab:
+            continue
+        s, o = r.get("Subject", "").strip(), r.get("Object", "").strip()
+        if len(s) < 3 or len(o) < 3:
+            continue
+        out.append({"Subject": s, "Relationship": lab, "Object": o,
+                    "Rel. Type": "causal", "Confidence": _CAUSAL_CONF.get(lab, 70),
+                    "Source Sentence": r.get("Source Sentence", "")})
+    return out
+
 def extract_causal(text: str) -> List[Dict]:
     results, seen = [], set()
     for sent in sent_tokenize(text):
         for pat, rel in CAUSAL_PATTERNS:
             for m in re.finditer(pat, sent, re.IGNORECASE):
                 try:
-                    s, o = m.group(1).strip(), m.group(2).strip()
+                    s = _causal_arg(m.group(1)); o = _causal_arg(m.group(2))
+                    if not s or not o:
+                        continue
                     key = (s.lower()[:40], rel, o.lower()[:40])
-                    if key not in seen and len(s) > 2 and len(o) > 2:
+                    if key not in seen:
                         seen.add(key)
                         results.append({"Subject": s, "Relationship": rel, "Object": o,
                                         "Rel. Type": "causal",
@@ -1612,8 +1687,18 @@ def analyze():
     entities        = build_entities(ent_counter, ent_sents, sents, concepts)
     typed_entities  = extract_typed_entities(combined)
     variables       = extract_variables(combined)
-    causal          = extract_causal(combined)
-    all_rels        = svo + causal
+    causal_regex    = extract_causal(combined)
+    # Causal set for chains/root-cause: clean SVO-derived pairs first (noun-phrase
+    # args), then regex pairs; deduped. all_rels keeps only the regex causal, since
+    # the SVO-derived ones are already present as syntactic SVO rows.
+    causal          = _svo_causal(svo) + causal_regex
+    _seen_causal    = set(); _dedup_causal = []
+    for _r in causal:
+        _k = (_r["Subject"].lower()[:40], _r["Relationship"], _r["Object"].lower()[:40])
+        if _k not in _seen_causal:
+            _seen_causal.add(_k); _dedup_causal.append(_r)
+    causal          = _dedup_causal
+    all_rels        = svo + causal_regex
     problems        = identify_problems(all_rels, entities, combined, sents, causal)
     dependencies    = build_dependencies(all_rels)
     causal_chains   = build_causal_chains(causal)
