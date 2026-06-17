@@ -457,12 +457,18 @@ def strip_references(text: str) -> str:
 # survive line-based de-boilerplating because markitdown flattens them inline, so
 # we scrub them with substitutions on the whole text.
 _PAGE_FURNITURE = [
-    re.compile(r"Downloaded from\s+[^\s]+\.org\S*", re.I),
-    re.compile(r"\bby\s+[A-Z][^\n]{0,60}?\s+on\s+\d{1,2}/\d{1,2}/\d{2,4}\b"),
-    re.compile(r"\bFor personal use only\.?", re.I),
-    re.compile(r"\b\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}\s+\d{1,2}:\d{2}(?:\s+\d{1,4})?\b"),
-    re.compile(r"\b[A-Z][a-z]{2,5}\.\s+Rev\.[^\n]{0,50}?\d{4}\.\d+:\d+[-–]\d+"),
+    # Whole download stamp through "... on MM/DD/YY". One lazy span so it works
+    # even when markitdown glues tokens ("...annualreviews.orgby U.S. Department
+    # of Agriculture on 09/27/06") — a separate "by ..." rule would miss those.
+    re.compile(r"Downloaded from\b[^\n]{0,140}?on\s+\d{1,2}/\d{1,2}/\d{2,4}\.?", re.I),
+    # Journal running head / volume locator ("Annu. Rev. Ecol. ... 2004.35:405-434").
+    re.compile(r"\b[A-Z][a-z]{2,5}\.\s+Rev\.[^\n]{0,60}?\d{4}\.\d+:\d+[-–]\d+\.?"),
     re.compile(r"\b\d{4}\.\d+:\d+[-–]\d+\b"),
+    # "For personal use only." plus any page number that trails the footer, so the
+    # next sentence doesn't inherit a stray "406"/"414" as its subject.
+    re.compile(r"\bFor personal use only\.?\s*\d{0,4}", re.I),
+    # Stray "DD Mon YYYY HH:MM <pagenum>" timestamps when present.
+    re.compile(r"\b\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}\s+\d{1,2}:\d{2}(?:\s+\d{1,4})?\b"),
 ]
 
 def strip_page_furniture(text: str) -> str:
