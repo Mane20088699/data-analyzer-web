@@ -407,7 +407,7 @@ def _cluster(emb: np.ndarray, threshold: float = 0.55) -> List[int]:
     except Exception:
         return [0] * n
 
-_HEADING_RE = re.compile(r"^(?:\d+(?:\.\d+)*[.)]?\s+)?[A-Z][^.!?]{2,68}$")
+_HEADING_RE = re.compile(r"^(?:\d+(?:\.\d+)*[.)]?\s+)?[A-Z][^.!?]{2,68}\.?$")
 
 def _headings(text: str) -> List[str]:
     """Heuristic heading lines (short, Title/UPPER case, no terminal period)."""
@@ -419,6 +419,23 @@ def _headings(text: str) -> List[str]:
             out.append(l.lower())
     return out
 
+def _isolate_headings(text: str) -> str:
+    """Ensure each heading line ends with '.' so spaCy treats it as a standalone
+    sentence. Without this, a heading like 'General Anatomy' glues into the first
+    word of the next sentence, producing SVO subjects like
+    'General Anatomy Most salamanders possess…'."""
+    out = []
+    for line in text.splitlines():
+        l = line.strip()
+        if l and (l.startswith("#") or
+                  (3 <= len(l) <= 70 and len(l.split()) <= 10 and
+                   (l.isupper() or _HEADING_RE.match(l))) and
+                  not l.endswith((".", "!", "?", ":"))):
+            out.append(line.rstrip() + ".")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
 def _tail_windows(text: str, head: int = 60_000, size: int = 20_000,
                   max_windows: int = 4) -> List[str]:
     """Sliding windows over the part of long docs KeyBERT's head pass misses."""
@@ -429,11 +446,18 @@ def _tail_windows(text: str, head: int = 60_000, size: int = 20_000,
 
 def normalize_unicode(text: str) -> str:
     """Repair encoding damage and decompose typographic ligatures.
-    ftfy fixes mojibake (CÃ´tÃ© → Côté); NFKC maps ligatures (ﬁ→fi, ﬂ→fl)
-    that ftfy's NFC pass leaves intact."""
+    ftfy fixes recoverable mojibake (CÃ´tÃ© → Côté); NFKC maps ligatures
+    (ﬁ→fi, ﬂ→fl) that ftfy's NFC pass leaves intact."""
     if ftfy is not None:
         text = ftfy.fix_text(text)
-    return unicodedata.normalize("NFKC", text)
+    text = unicodedata.normalize("NFKC", text)
+    # ftfy can't recover a dash that lost its continuation bytes in extraction:
+    # "150–200" → Latin-1-decoded to "â\x80\x93", the control bytes are stripped,
+    # leaving a lone "â" (or ftfy's "�"). Restore it from context.
+    text = re.sub(r"(?<=\d)\s*[âÂ�]\s*(?=\d)", "–", text)       # numeric ranges
+    text = re.sub(r"(?<=\w) [âÂ�] (?=\w)", " — ", text)          # separator dashes
+    text = re.sub(r"(?<=\w)[âÂ�](?=[\s.,;:)\]]|$)", "", text)    # word-final stray
+    return text
 
 # Reference/bibliography section headings. Specific phrases match case-insensitively
 # (rare in prose); bare "REFERENCES" only in its uppercase heading form so a
@@ -452,6 +476,31 @@ def strip_references(text: str) -> str:
         if m.start() >= len(text) * 0.5:
             return text[:m.start()].rstrip()
     return text
+
+# Inline academic citations in the body — the dominant noise source on review
+# PDFs. Both forms are anchored on a 4-digit 19xx/20xx year, so neither fires on
+# "(see Table 1)", "(p < 0.05)", "(Amphibia: Caudata)" or citation-free prose.
+# Narrative form removes the surname *and* the year ("Hairston (1987)") so the
+# author name doesn't survive as a PERSON entity; parenthetical form removes the
+# whole "(Author Year; …)" group.
+_CITE_NARRATIVE = re.compile(
+    r"\b[A-Z][A-Za-z'’\-]+"
+    r"(?:\s+(?:et al\.?|and|&)\s+[A-Z][A-Za-z'’\-]+)*"
+    r"\s*\((?:19|20)\d{2}[a-z]?(?:[,;]\s*[A-Za-z0-9]+)*\)")
+_CITE_PAREN = re.compile(r"\([^()]*\b(?:19|20)\d{2}[a-z]?\b[^()]*\)")
+_CITE_ORPHAN_PAREN = re.compile(r"\(\s*[;,]?\s*\)")
+_CITE_ORPHAN_ETAL = re.compile(r"\s+et al\.?(?=[\s,.;)]|$)", re.I)
+
+def strip_inline_citations(text: str) -> str:
+    """Remove inline author-year citations from the body so cited-author names
+    ('Hairston (1987)', '(Welsh & Lind 1988, 1991)') don't become phantom
+    PERSON/ORG entities or spurious relationship/causal endpoints. Year-anchored,
+    so it leaves non-citation parentheticals and citation-free documents intact."""
+    text = _CITE_NARRATIVE.sub("", text)
+    text = _CITE_PAREN.sub("", text)
+    text = _CITE_ORPHAN_ETAL.sub("", text)
+    text = _CITE_ORPHAN_PAREN.sub("", text)
+    return re.sub(r"[ \t]{2,}", " ", text)
 
 # Recurring PDF page furniture (download stamps, running heads, timestamps). These
 # survive line-based de-boilerplating because markitdown flattens them inline, so
@@ -500,6 +549,8 @@ def preprocess_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"-\n(?=[a-z])", "", text)                 # de-hyphenate wraps
     text = strip_page_furniture(text)
+    text = strip_inline_citations(text)
+    text = _isolate_headings(text)
     text = flatten_md_tables(text)
     lines = [l.rstrip() for l in text.split("\n")]
     # Drop repeated page headers/footers (same short line appearing many times).
@@ -695,6 +746,26 @@ def build_entities(ent_counter: Counter, ent_sents: Dict[str, set],
                    sents: List[str], concepts: List[Dict]) -> List[Dict]:
     raw = [{"text": t, "type": l, "count": c} for (t, l), c in ent_counter.items()]
     raw.sort(key=lambda e: (-len(e["text"]), -e["count"]))
+
+    # Collapse contradictory labels for the same surface form via plurality vote.
+    # spaCy can tag "Ambystoma" as PERSON, GPE, NORP, and ORG across sentences;
+    # keeping all four fragments counts and confuses the output. Each lowercased
+    # surface gets reassigned to its most-seen label so counts consolidate.
+    label_votes: Dict[str, Counter] = defaultdict(Counter)
+    for e in raw:
+        label_votes[e["text"].lower()][e["type"]] += e["count"]
+    best_label: Dict[str, str] = {
+        surf: votes.most_common(1)[0][0] for surf, votes in label_votes.items()
+    }
+    merged_raw: Dict[tuple, Dict] = {}
+    for e in raw:
+        canonical_type = best_label[e["text"].lower()]
+        key = (e["text"].lower(), canonical_type)
+        if key in merged_raw:
+            merged_raw[key]["count"] += e["count"]
+        else:
+            merged_raw[key] = {"text": e["text"], "type": canonical_type, "count": e["count"]}
+    raw = sorted(merged_raw.values(), key=lambda e: (-len(e["text"]), -e["count"]))
 
     # Merge aliases of the same type when one name's tokens subset another's
     # (e.g. "Smith" → "John Smith", "Apple" → "Apple Inc").
@@ -966,6 +1037,7 @@ def extract_variables(text: str) -> List[Dict]:
                     # bare unit like "kg" for the measurement pattern.)
                     if name.lower().rstrip(".") in _VAR_NAME_STOP: continue
                     if re.fullmatch(r"(?:19|20)\d{2}[a-z]?", name): continue
+                    if re.fullmatch(r"[\d.]+", name): continue
                     if re.fullmatch(r"[A-Za-z]", val): continue
                     key = (name.lower()[:30], val[:20])
                     if key not in seen:
@@ -1233,7 +1305,7 @@ def identify_problems(rels: List[Dict], entities: List[Dict], text: str,
         src_w = _word_set(srcl); rel_w = _word_set(rel)
         triple_w = rel_w | _word_set(s) | _word_set(o)
 
-        if (SECURITY_WORDS & src_w) or (SECURITY_WORDS & triple_w):
+        if SECURITY_WORDS & triple_w:
             sev, ptype = "Critical", "security / safety risk"
         elif PROBLEM_WORDS & triple_w:
             sev, ptype = "High", "problem keyword"
