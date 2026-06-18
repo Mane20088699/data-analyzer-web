@@ -689,6 +689,16 @@ def extract_concepts(text: str, sents: List[str], ent_sents: Dict[str, set]) -> 
             if re.fullmatch(r'[\d\s,.\-]+', kw): continue
             if len(words) == 1 and len(kw) <= 2: continue
             if all(w in STOPWORDS for w in words): continue
+            # Concepts should be 1-2 words. Allow 3+ only for proper names where
+            # a non-first token is capitalised ("Eastern Red-backed Salamander",
+            # "Great Smoky Mountains"). Generic 3-word phrases are trimmed to 2.
+            kw_tokens = kw.split()
+            if len(kw_tokens) > 2:
+                if not any(t[0].isupper() for t in kw_tokens[1:] if t):
+                    kw = " ".join(kw_tokens[:2])
+                    # Skip if the trimmed form is already present with a better score
+                    if kw in cand and cand[kw] >= sc:
+                        continue
             cands.append((kw, sc))
         if not cands:
             return []
