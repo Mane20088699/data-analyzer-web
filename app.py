@@ -427,10 +427,16 @@ def _isolate_headings(text: str) -> str:
     out = []
     for line in text.splitlines():
         l = line.strip()
-        if l and (l.startswith("#") or
-                  (3 <= len(l) <= 70 and len(l.split()) <= 10 and
-                   (l.isupper() or _HEADING_RE.match(l))) and
-                  not l.endswith((".", "!", "?", ":"))):
+        if l.startswith("#"):
+            # Strip "#" markers so spaCy never sees "# Heading Text" as an ORG entity.
+            clean = re.sub(r"^#+\s*", "", l)
+            if clean and not clean.endswith((".", "!", "?", ":")):
+                out.append(clean + ".")
+            else:
+                out.append(clean)
+        elif (l and 3 <= len(l) <= 70 and len(l.split()) <= 10 and
+              (l.isupper() or _HEADING_RE.match(l)) and
+              not l.endswith((".", "!", "?", ":"))):
             out.append(line.rstrip() + ".")
         else:
             out.append(line)
@@ -455,9 +461,14 @@ def normalize_unicode(text: str) -> str:
     # ftfy can't recover a dash that lost its continuation bytes in extraction:
     # "150–200" → Latin-1-decoded to "â\x80\x93", the control bytes are stripped,
     # leaving a lone "â" (or ftfy's "�"). Restore it from context.
-    text = re.sub(r"(?<=\d)\s*[âÂ�]\s*(?=\d)", "–", text)       # numeric ranges
-    text = re.sub(r"(?<=\w) [âÂ�] (?=\w)", " — ", text)          # separator dashes
-    text = re.sub(r"(?<=\w)[âÂ�](?=[\s.,;:)\]]|$)", "", text)    # word-final stray
+    # Numeric ranges: allow hidden control chars between digit and â ("20\x80â\x9330")
+    text = re.sub(r"(?<=\d)[^\w\s]*[âÂ�][^\w\s]*(?=\d)", "–", text)
+    # Word–word with no spaces ("poplarânorthern", "forestâstream") → en-dash
+    text = re.sub(r"(?<=\w)[âÂ�](?=\w)", "–", text)
+    # Word — word with spaces ("habitat â structure") → em-dash
+    text = re.sub(r"(?<=\w) [âÂ�] (?=\w)", " — ", text)
+    # Word-final stray â before punctuation or end → strip
+    text = re.sub(r"(?<=\w)[âÂ�](?=[\s.,;:)\]]|$)", "", text)
     return text
 
 # Reference/bibliography section headings. Specific phrases match case-insensitively
@@ -531,7 +542,8 @@ _PAGE_FURNITURE = [
     # All-caps author byline with page-number prefix: "412 DAVIC WELSH" (after cid removal).
     re.compile(r"\b\d{3,4}\s+[A-Z]{3,}(?:\s+[A-Z]{3,})+\b"),
     # LaTeX / typesetter production codes: "LaTeX2e. P1: GJB."
-    re.compile(r"\bLaTeX2e\.?\s+P\d+:\s+[A-Z]{2,3}\.?\b", re.I),
+    # Trailing \b fails when the match ends with "." (non-word char), so use lookahead.
+    re.compile(r"\bLaTeX2e\.?\s+P\d+:\s+[A-Z]{2,3}\.?(?=[\s,.]|$)", re.I),
     # Timestamp without leading day: "Oct 2004 12:35" or "Oct 2004 12:35 406"
     re.compile(
         r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
