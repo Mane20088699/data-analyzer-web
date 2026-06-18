@@ -451,6 +451,7 @@ def normalize_unicode(text: str) -> str:
     if ftfy is not None:
         text = ftfy.fix_text(text)
     text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\x80-\x9f]", "", text)                            # strip C1 controls
     # ftfy can't recover a dash that lost its continuation bytes in extraction:
     # "150–200" → Latin-1-decoded to "â\x80\x93", the control bytes are stripped,
     # leaving a lone "â" (or ftfy's "�"). Restore it from context.
@@ -483,9 +484,15 @@ def strip_references(text: str) -> str:
 # Narrative form removes the surname *and* the year ("Hairston (1987)") so the
 # author name doesn't survive as a PERSON entity; parenthetical form removes the
 # whole "(Author Year; …)" group.
+_CITE_BARE = re.compile(
+    r"\b[A-Z][A-Za-z’’\-]+"
+    r"(?:\s+(?:et al\.?|and|&)\s+[A-Z][A-Za-z’’\-]+)*"
+    r"\s+(?:19|20)\d{2}[a-z]?"
+    r"(?:[,;]\s*(?:19|20)\d{2}[a-z]?)*"
+    r"\b")
 _CITE_NARRATIVE = re.compile(
-    r"\b[A-Z][A-Za-z'’\-]+"
-    r"(?:\s+(?:et al\.?|and|&)\s+[A-Z][A-Za-z'’\-]+)*"
+    r"\b[A-Z][A-Za-z’’\-]+"
+    r"(?:\s+(?:et al\.?|and|&)\s+[A-Z][A-Za-z’’\-]+)*"
     r"\s*\((?:19|20)\d{2}[a-z]?(?:[,;]\s*[A-Za-z0-9]+)*\)")
 _CITE_PAREN = re.compile(r"\([^()]*\b(?:19|20)\d{2}[a-z]?\b[^()]*\)")
 _CITE_ORPHAN_PAREN = re.compile(r"\(\s*[;,]?\s*\)")
@@ -493,9 +500,10 @@ _CITE_ORPHAN_ETAL = re.compile(r"\s+et al\.?(?=[\s,.;)]|$)", re.I)
 
 def strip_inline_citations(text: str) -> str:
     """Remove inline author-year citations from the body so cited-author names
-    ('Hairston (1987)', '(Welsh & Lind 1988, 1991)') don't become phantom
+    (‘Hairston (1987)’, ‘(Welsh & Lind 1988, 1991)’) don’t become phantom
     PERSON/ORG entities or spurious relationship/causal endpoints. Year-anchored,
     so it leaves non-citation parentheticals and citation-free documents intact."""
+    text = _CITE_BARE.sub("", text)
     text = _CITE_NARRATIVE.sub("", text)
     text = _CITE_PAREN.sub("", text)
     text = _CITE_ORPHAN_ETAL.sub("", text)
@@ -518,6 +526,16 @@ _PAGE_FURNITURE = [
     re.compile(r"\bFor personal use only\.?\s*\d{0,4}", re.I),
     # Stray "DD Mon YYYY HH:MM <pagenum>" timestamps when present.
     re.compile(r"\b\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}\s+\d{1,2}:\d{2}(?:\s+\d{1,4})?\b"),
+    # (cid:N) PDF glyph-substitution artifacts — must come before byline pattern.
+    re.compile(r"\(cid:\d+\)"),
+    # All-caps author byline with page-number prefix: "412 DAVIC WELSH" (after cid removal).
+    re.compile(r"\b\d{3,4}\s+[A-Z]{3,}(?:\s+[A-Z]{3,})+\b"),
+    # LaTeX / typesetter production codes: "LaTeX2e. P1: GJB."
+    re.compile(r"\bLaTeX2e\.?\s+P\d+:\s+[A-Z]{2,3}\.?\b", re.I),
+    # Timestamp without leading day: "Oct 2004 12:35" or "Oct 2004 12:35 406"
+    re.compile(
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"\s+\d{4}\s+\d{1,2}:\d{2}(?:\s+\d{1,4})?\b"),
 ]
 
 def strip_page_furniture(text: str) -> str:
