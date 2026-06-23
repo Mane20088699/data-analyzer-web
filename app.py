@@ -600,6 +600,12 @@ _CITE_ORPHAN_ETAL = re.compile(r"\s+et al\.?(?=[\s,.;)]|$)", re.I)
 # so "Cas13", "Cas9", "NHEJ13" (uppercase prefix) are left untouched.
 _CITE_SUPER = re.compile(r"(?<=[a-z]{4})\d{2,3}(?:[,–]\d{1,3})*(?=[^a-zA-Z\d]|$)")
 
+# Object / subject values that are page-furniture artifacts, not real findings.
+_HALLUC_NOISE_RE = re.compile(
+    r"^(?:latex2e\.?|figure\s*\d*|fig\.?\s*\d*|table\s*\d+|"
+    r"p\d+\s*:\s*[a-z]+|cregression|latex|et al\.?|\d+[a-z]?\s*taxon"
+    r"|\(cid:\d+\))\s*$", re.I)
+
 def strip_inline_citations(text: str) -> str:
     """Remove inline author-year citations from the body so cited-author names
     (‘Hairston (1987)’, ‘(Welsh & Lind 1988, 1991)’) don’t become phantom
@@ -1359,9 +1365,77 @@ def extract_causal(text: str) -> List[Dict]:
 
 def _display_rel(r: Dict) -> Dict:
     """Strip internal keys (_si …) and fix column order for the relationships table."""
-    return {"Subject": r.get("Subject", ""), "Relationship": r.get("Relationship", ""),
-            "Object": r.get("Object", ""), "Rel. Type": r.get("Rel. Type", ""),
-            "Confidence": r.get("Confidence", ""), "Source Sentence": r.get("Source Sentence", "")}
+    d = {"Subject": r.get("Subject", ""), "Relationship": r.get("Relationship", ""),
+         "Object": r.get("Object", ""), "Rel. Type": r.get("Rel. Type", ""),
+         "Confidence": r.get("Confidence", ""), "Source Sentence": r.get("Source Sentence", "")}
+    if r.get("_hallucination_risk"):
+        d["Hallucination Risk"] = r["_hallucination_risk"]
+    return d
+
+# ── Hallucination validation ─────────────────────────────────────────────────
+
+def _terms_in_source(phrase: str, sentence: str) -> int:
+    """Count distinct content words (≥4 chars) from phrase that appear in sentence."""
+    sent_l = sentence.lower()
+    return sum(1 for w in re.split(r"\W+", phrase.lower()) if len(w) >= 4 and w in sent_l)
+
+def _verb_negated(verb: str, sentence: str) -> bool:
+    """True if the relationship verb is immediately preceded by a negation in the source sentence."""
+    if not verb or not sentence:
+        return False
+    pat = re.compile(
+        r"\b(?:not|no|never|cannot|can'?t|don'?t|doesn'?t|didn'?t|won'?t|"
+        r"wouldn'?t|isn'?t|aren'?t|wasn'?t|weren'?t|fail(?:s|ed)?|lack(?:s|ed)?)"
+        r"(?:\s+\w+){0,2}\s+" + re.escape(verb.lower()),
+        re.I)
+    return bool(pat.search(sentence))
+
+def validate_findings(rels: List[Dict]) -> List[Dict]:
+    """
+    Ground each relationship against its source sentence.
+
+    Rule 1 — suppress if subject or object is a page-furniture noise token.
+    Rule 2 — suppress if neither subject nor object has any content word (≥4 chars)
+              in the source sentence (relationship not grounded in the cited text).
+    Rule 3 — lower confidence (−20) and flag when the relationship verb appears
+              negated in the source sentence (SVO extractor loses polarity).
+    Rule 4 — lower confidence (−10) and flag for embedding-inferred relationships
+              since they are not directly text-grounded.
+    """
+    out = []
+    for r in rels:
+        subj  = r.get("Subject", "")
+        obj   = r.get("Object", "")
+        verb  = r.get("Relationship", "")
+        sent  = r.get("Source Sentence", "")
+        rtype = r.get("Rel. Type", "")
+
+        # Rule 1: noise token in subject or object
+        if _HALLUC_NOISE_RE.match(obj.strip()) or _HALLUC_NOISE_RE.match(subj.strip()):
+            continue
+
+        # Rule 2: zero content words from (subj + obj) appear in source sentence
+        if sent and _terms_in_source(subj + " " + obj, sent) == 0:
+            continue
+
+        conf  = r.get("Confidence", 65)
+        flags: list[str] = []
+
+        # Rule 3: verb appears negated in source sentence — polarity may be inverted
+        if _verb_negated(verb, sent):
+            conf = max(25, conf - 20)
+            flags.append("negated")
+
+        # Rule 4: embedding-inferred, not directly text-grounded
+        if "inferred" in rtype:
+            conf = max(30, conf - 10)
+            flags.append("inferred")
+
+        r = dict(r, Confidence=conf)
+        if flags:
+            r["_hallucination_risk"] = ", ".join(flags)
+        out.append(r)
+    return out
 
 # ── Dependency mapping ──────────────────────────────────────────────────────────
 def build_dependencies(rels: List[Dict]) -> List[Dict]:
@@ -2045,6 +2119,8 @@ def analyze():
             _seen_causal.add(_k); _dedup_causal.append(_r)
     causal          = _dedup_causal
     all_rels        = svo + causal_regex
+    all_rels        = validate_findings(all_rels)
+    causal          = validate_findings(causal)
     problems        = identify_problems(all_rels, entities, combined, sents, causal)
     dependencies    = build_dependencies(all_rels)
     causal_chains   = build_causal_chains(causal)
