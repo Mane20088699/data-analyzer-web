@@ -565,11 +565,14 @@ def strip_references(text: str) -> str:
         if m.start() >= len(text) * 0.5:
             return text[:m.start()].rstrip()
     # Fallback: numbered reference list style (Nature, Science, Cell, etc.) that
-    # has no explicit heading. Require 5+ matches so a short numbered list in the
-    # body (e.g., "1. Introduction") never triggers the cut.
-    back_start = int(len(text) * 0.6)
+    # has no explicit heading. Lower threshold to 50%/3 matches to handle two-column
+    # PDFs where MarkItDown outputs left-column refs (1–20) before right-column refs
+    # (21–200+), so the earliest numbered ref entry can appear in the first 60% of
+    # extracted text. The pattern is surname+initial-specific so "1. Introduction"
+    # never triggers it.
+    back_start = int(len(text) * 0.50)
     matches = list(_NUMBERED_REF_LINE_RE.finditer(text, back_start))
-    if len(matches) >= 5:
+    if len(matches) >= 3:
         return text[:matches[0].start()].rstrip()
     return text
 
@@ -592,6 +595,10 @@ _CITE_NARRATIVE = re.compile(
 _CITE_PAREN = re.compile(r"\([^()]*\b(?:19|20)\d{2}[a-z]?\b[^()]*\)")
 _CITE_ORPHAN_PAREN = re.compile(r"\(\s*[;,]?\s*\)")
 _CITE_ORPHAN_ETAL = re.compile(r"\s+et al\.?(?=[\s,.;)]|$)", re.I)
+# Superscript reference numbers glued to words in PDF extraction: "pathogens120",
+# "genome39", "genes80,81", "edits13,17–20". Lookbehind requires 4+ lowercase chars
+# so "Cas13", "Cas9", "NHEJ13" (uppercase prefix) are left untouched.
+_CITE_SUPER = re.compile(r"(?<=[a-z]{4})\d{2,3}(?:[,–]\d{1,3})*(?=[^a-zA-Z\d]|$)")
 
 def strip_inline_citations(text: str) -> str:
     """Remove inline author-year citations from the body so cited-author names
@@ -603,6 +610,7 @@ def strip_inline_citations(text: str) -> str:
     text = _CITE_PAREN.sub("", text)
     text = _CITE_ORPHAN_ETAL.sub("", text)
     text = _CITE_ORPHAN_PAREN.sub("", text)
+    text = _CITE_SUPER.sub("", text)
     return re.sub(r"[ \t]{2,}", " ", text)
 
 # Recurring PDF page furniture (download stamps, running heads, timestamps). These
@@ -749,6 +757,10 @@ def parse_document(text: str):
                 if re.match(r"^[A-Z]\.[A-Z]?\.\s+[A-Z]", t) and len(t.split()) <= 4:
                     continue
                 if re.match(r"^[A-Z]\.\s+[A-Z][a-z]", t) and len(t.split()) <= 3:
+                    continue
+                # Same for "H. CRISPR" — initial then ALL-CAPS acronym (Fix X misses these
+                # because the pattern requires [a-z] after the first capital).
+                if re.match(r"^[A-Z]\.\s+[A-Z]{2,}", t) and len(t.split()) <= 3:
                     continue
                 # Drop bare author initials like "R.B.", "D.", "S.H."
                 if re.fullmatch(r"[A-Z](?:\.[A-Z])*\.?", t):
