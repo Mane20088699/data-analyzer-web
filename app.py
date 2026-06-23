@@ -139,6 +139,25 @@ DEP_REL_WORDS = {
     "include","includes","built on","powered by","derived from",
 }
 
+# Direct sentence patterns for ecological/conservation risk (used in identify_problems).
+# Complements the PROBLEM_WORDS triple-match by scanning sentence text directly.
+_RISK_PATS = [
+    (re.compile(
+        r"\b(?:imperiled?|critically\s+imperiled?|endangered|threatened)\b", re.I),
+     "High", "conservation status"),
+    (re.compile(
+        r"\b(?:declin\w+|decreas\w+)\b.{0,80}\b(?:unknown|consequences|ecosystem\s+process)\b",
+        re.I | re.DOTALL),
+     "High", "population decline with unknown consequences"),
+    (re.compile(r"\bloss\s+of\s+(?:keystone|salamander|critical)\b", re.I),
+     "High", "keystone species loss"),
+    (re.compile(r"\bserious\s+negative\s+effects?\b", re.I),
+     "High", "serious negative effects"),
+    (re.compile(
+        r"\b(?:extinction|extirpat\w+)\b", re.I),
+     "Critical", "extinction risk"),
+]
+
 # Opposing predicate pairs → flag contradictory relationships on the same pair.
 ANTONYM_PAIRS = [
     ("increase","decrease"),("increases","decreases"),("enable","prevent"),
@@ -160,7 +179,13 @@ ASSUMPTION_MARKERS = {
 _NEGATIONS = {
     "not","no","never","cannot","can't","won't","doesn't","don't","isn't",
     "aren't","wasn't","weren't","without","unable","none","neither","nor",
+    "does not","is not","do not","did not","has not","have not",
 }
+
+# Contrastive discourse markers that introduce an explicit author-flagged tension.
+_CONTRAST_MARKERS_RE = re.compile(
+    r"\b(?:however|nevertheless|yet|in contrast|contrary to|"
+    r"although|even though|whereas|on the other hand|that said)\b", re.I)
 
 # Per-pattern confidence for causal/relational regexes (explicit causality > weak association).
 _CAUSAL_CONF = {
@@ -204,6 +229,23 @@ CAUSAL_PATTERNS: List[Tuple[str, str]] = [
     (r"(\w[\w\s]{1,40}?)\s+recognizes?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "recognizes"),
     (r"(\w[\w\s]{1,40}?)\s+escapes?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "escapes"),
 ]
+
+# Scientific density/biomass patterns used alongside VARIABLE_PATTERNS.
+# Capture number+unit spans like "18,486 salamanders/ha", "1,770 g/ha".
+_DENSITY_RE = re.compile(
+    r"\d[\d,]*(?:\.\d+)?\s+"
+    r"(?:salamanders?|individuals?|animals?|organisms?|specimens?|newts?|"
+    r"plethodon|ambystoma|desmognathus|vertebrates?)\s*(?:per|/)\s*"
+    r"(?:ha|hectare|m[²2]|km[²2])",
+    re.I)
+_BIOMASS_RE = re.compile(
+    r"\d[\d,]*(?:\.\d+)?\s*"
+    r"(?:g|kg|kcal|kJ)\s*(?:per|/)\s*(?:ha|m[²2]|hectare|m2)\b",
+    re.I)
+_BIOUNIT_RE = re.compile(
+    r"\d[\d,]*(?:\.\d+)?\s*"
+    r"(?:g|kcal)\s+(?:ha|m[²2])[-–]\s*1\b",
+    re.I)
 
 VARIABLE_PATTERNS: List[Tuple[str, str]] = [
     (r"\b([A-Z][a-zA-Z0-9_]{1,20})\s*=\s*([\d.]+\s*[a-zA-Z%°/]*)", "assignment"),
@@ -251,6 +293,8 @@ _ENTITY_STOPWORDS = {
     "ed", "eds", "vol", "pp", "fig", "no", "et al", "limnol", "oceanogr", "midl",
     "freshw", "copeia", "oikos", "ecosys", "geogr", "behav", "entomol", "pac",
     "gtr", "cv", "phd", "doi", "isbn",
+    # Table/figure reference labels and footnote markers
+    "table", "figure", "appendix", "adata", "bdata", "cdata",
 }
 
 def _is_noise_date(t: str) -> bool:
@@ -573,6 +617,19 @@ def flatten_md_tables(text: str) -> str:
             out.append(line)
     return "\n".join(out)
 
+def _strip_md_tables_for_kb(text: str) -> str:
+    """Remove markdown table rows before KeyBERT so taxonomy/data tables don't
+    contaminate concept extraction with garbled pairs like 'proteidae mudpuppies'."""
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if _MD_TABLE_SEP.match(s):
+            continue
+        if s.startswith("|") and s.count("|") >= 2:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
 def preprocess_text(text: str) -> str:
     """Normalise text before it reaches KeyBERT/spaCy (the 'preprocessing' layer)."""
     text = normalize_unicode(text)
@@ -611,6 +668,14 @@ def parse_document(text: str):
             si = len(sents)
             sents.append(stext)
 
+            # Skip NER + SVO on heading-only sentences (short, all Title-Case).
+            # _isolate_headings converts "# Feeding Ecology" → "Feeding Ecology."
+            # which spaCy parses as a micro-sentence and mislabels as ORG/PERSON.
+            _stw = stext.rstrip(".")
+            if (1 <= len(_stw.split()) <= 8 and len(_stw) <= 70
+                    and all(w[0].isupper() for w in _stw.split() if w[0].isalpha())):
+                continue
+
             for ent in sent.ents:
                 t = ent.text.strip(); label = ent.label_
                 if len(t) <= 1: continue
@@ -629,6 +694,12 @@ def parse_document(text: str):
                     continue
                 if label == "GPE" and (_PERSON_PREFIXES.match(t) or "'" in t):
                     label = "PERSON"
+                # Drop footnote-prefixed fragments like "1Ohio EPA", "2USDA Forest Service"
+                if re.match(r"^\d[A-Z]", t):
+                    continue
+                # Drop dangling citation fragments ending with "&" ("Burton & Likens &")
+                if t.rstrip().endswith("&"):
+                    continue
                 ent_counter[(t, label)] += 1
                 ent_sents[t.lower()].add(si)
 
@@ -647,8 +718,9 @@ def parse_document(text: str):
                     st = _clean(" ".join(w.text for w in s.subtree
                                          if w.dep_ not in ("det","punct") and len(w.text) > 1))
                     for o in objs:
-                        ot = _clean(" ".join(w.text for w in o.subtree
-                                             if w.dep_ not in ("det","punct") and len(w.text) > 1))
+                        o_toks = [w for w in o.subtree
+                                  if w.dep_ not in ("det","punct") and len(w.text) > 1][:12]
+                        ot = _clean(" ".join(w.text for w in o_toks))
                         if st and ot and len(st) > 2:
                             svo.append({"Subject": st, "Relationship": verb, "Object": ot,
                                         "Rel. Type": "syntactic (SVO)", "Confidence": 65,
@@ -677,8 +749,9 @@ def extract_concepts(text: str, sents: List[str], ent_sents: Dict[str, set]) -> 
                     top_n=n, use_mmr=True, diversity=0.5):
                 cand[kw] = max(cand.get(kw, 0.0), sc * weight)
 
-        _harvest(text[:60_000], 1.0, 40)
-        for w in _tail_windows(text):
+        kb_text = _strip_md_tables_for_kb(text)
+        _harvest(kb_text[:60_000], 1.0, 40)
+        for w in _tail_windows(kb_text):
             _harvest(w, 0.85, 10)
 
         # 2 ── filter trivial / numeric / too-short candidates
@@ -1085,6 +1158,20 @@ def extract_variables(text: str) -> List[Dict]:
                         results.append({"Variable / Parameter": name, "Value": val,
                                         "Type": vtype, "Context": _clean(sent)})
                 except Exception: continue
+
+    # Scientific density/biomass values (e.g., "18,486 salamanders/ha", "1,770 g/ha")
+    for sent in sent_tokenize(text):
+        for rx, param in ((_DENSITY_RE, "salamander density"),
+                          (_BIOMASS_RE, "biomass"),
+                          (_BIOUNIT_RE, "biomass")):
+            for m in rx.finditer(sent):
+                val = m.group(0).strip()
+                key = (param, val[:30])
+                if key not in seen:
+                    seen.add(key)
+                    results.append({"Variable / Parameter": param,
+                                    "Value": val, "Type": "measurement",
+                                    "Context": _clean(sent)})
     return results
 
 # ── Causal / relational regex extraction (with confidence) ──────────────────────
@@ -1293,6 +1380,28 @@ def detect_contradictions(rels: List[Dict], variables: List[Dict],
                 out.append({"Statement A": _clean(src1, 160) or f"{s} {r1} {o}",
                             "Statement B": _clean(src2, 160) or f"{s} {r2} {o}",
                             "Conflict Type": ctype, "Severity": "High"})
+    # 3 ── Contrastive sentences (explicit author-flagged tensions like "however
+    # it does not follow that…"). Statement A = the claim being contrasted (the
+    # previous sentence); Statement B = the contrasting sentence.
+    for i, sent in enumerate(sents):
+        if not _CONTRAST_MARKERS_RE.search(sent):
+            continue
+        if len(sent) < 50:
+            continue
+        sent_low = sent.lower()
+        if not any(ng in sent_low for ng in _NEGATIONS):
+            continue
+        stmt_a = sents[i - 1] if i > 0 else ""
+        if len(stmt_a) < 25:
+            continue
+        key = ("contrast", sent[:70])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"Statement A": _clean(stmt_a, 180),
+                    "Statement B": _clean(sent, 180),
+                    "Conflict Type": "contrastive claim",
+                    "Severity": "Medium"})
     return out[:60]
 
 # ── Assumption discovery ────────────────────────────────────────────────────────
@@ -1368,6 +1477,23 @@ def identify_problems(rels: List[Dict], entities: List[Dict], text: str,
                          "Root Causes": ", ".join(roots),
                          "Affected Entities": ", ".join(affected),
                          "Source Sentence": _clean(src, 200)})
+
+    # Direct sentence scan for conservation/ecological risk statements
+    for sent in sents:
+        for rx, sev, ptype in _RISK_PATS:
+            if rx.search(sent):
+                key = ("risk_sentence", sent[:70])
+                if key in seen:
+                    continue
+                seen.add(key)
+                affected = [e for e in ent_names if e.lower() in sent.lower()][:4]
+                problems.append({
+                    "Subject": "ecosystem", "Relationship": "faces",
+                    "Object": ptype, "Problem Type": "ecological risk",
+                    "Severity": sev, "Root Causes": "",
+                    "Affected Entities": ", ".join(affected),
+                    "Source Sentence": _clean(sent, 200),
+                })
 
     sev_rank = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
     problems.sort(key=lambda p: sev_rank.get(p["Severity"], 9))
@@ -1696,6 +1822,8 @@ def _export_excel_bytes(results: Dict) -> bytes:
     ws("Contradictions",         results["contradictions"], hfill=RH)
     ws("Assumptions",            results["assumptions"])
     ws("Executive Insights",     results["insights"])
+    ws("Graph Nodes",            results["graph"]["nodes"])
+    ws("Graph Edges",            results["graph"]["edges"])
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1709,7 +1837,9 @@ def _export_csv_bytes(results: Dict) -> bytes:
               "variables": results["variables"], "relationships": results["relationships"],
               "dependencies": results["dependencies"], "causal_chains": results["causal_chains"],
               "problems": results["problems"], "contradictions": results["contradictions"],
-              "assumptions": results["assumptions"], "insights": results["insights"]}
+              "assumptions": results["assumptions"], "insights": results["insights"],
+              "graph_nodes": results["graph"]["nodes"],
+              "graph_edges": results["graph"]["edges"]}
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in sheets.items():
             csv_str = pd.DataFrame(data if data else [{name: "No data"}]).to_csv(index=False, encoding="utf-8-sig")
@@ -1745,6 +1875,8 @@ def _export_markdown_bytes(results: Dict) -> bytes:
     out += section("Problem Relationships",  results["problems"])
     out += section("Contradictions",         results["contradictions"])
     out += section("Assumptions",            results["assumptions"])
+    out += section("Knowledge Graph – Nodes", results["graph"]["nodes"])
+    out += section("Knowledge Graph – Edges", results["graph"]["edges"])
     return "\n".join(out).encode("utf-8")
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
