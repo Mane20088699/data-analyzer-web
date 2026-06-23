@@ -247,6 +247,18 @@ _BIOUNIT_RE = re.compile(
     r"(?:g|kcal)\s+(?:ha|m[²2])[-–]\s*1\b",
     re.I)
 
+# Molecular-biology inline quantity patterns: gene counts, sequence lengths,
+# inheritance/efficiency percentages. Each entry: (compiled-regex, param-name).
+# Group 1 = value (number), Group 2 = unit label.
+_MOLBIO_INLINE = [
+    (re.compile(r"(~?[\d,]+(?:\.\d+)?)\s+(genes?)\b", re.I), "gene count"),
+    (re.compile(r"(~?[\d,]+(?:\.\d+)?)\s+(base\s+pairs?|bp)\b", re.I), "sequence length (bp)"),
+    (re.compile(r"(\d+)[\-–]nt\b", re.I), "sequence length (nt)"),
+    (re.compile(r"(\d+)\s+(nt)\b(?:\s+(?:spacer|target|recognition|seed|guide|protospacer))", re.I), "spacer length"),
+    (re.compile(r"(>?\s*\d+(?:\.\d+)?)\s*(%)\s*(?:of\s+[\w\s]{1,30})?(?=\s+(?:inheritance|efficiency|accuracy|specificity|off.target|success|edit|correct))", re.I), "efficiency/rate"),
+    (re.compile(r"(~?[\d,]+(?:\.\d+)?)\s+(cell\s+lines?|organisms?|species)\b", re.I), "sample count"),
+]
+
 VARIABLE_PATTERNS: List[Tuple[str, str]] = [
     (r"\b([A-Z][a-zA-Z0-9_]{1,20})\s*=\s*([\d.]+\s*[a-zA-Z%°/]*)", "assignment"),
     (r"\b([a-zA-Z_]\w{1,20})\s+is\s+set\s+to\s+([\d.]+\s*[a-zA-Z%°/]*)", "configured"),
@@ -295,6 +307,10 @@ _ENTITY_STOPWORDS = {
     "gtr", "cv", "phd", "doi", "isbn",
     # Table/figure reference labels and footnote markers
     "table", "figure", "appendix", "adata", "bdata", "cdata",
+    # Molecular-biology / genomics journal abbreviations that NER reads as names
+    "nat", "biotechnol", "genet", "genomics", "cell", "science", "nature",
+    "biochem", "mol", "physiol", "plant", "microbiol", "immunol", "virol",
+    "nucleic", "genome", "rna", "dna", "pnas", "plos", "elife", "embo",
 }
 
 def _is_noise_date(t: str) -> bool:
@@ -343,6 +359,13 @@ _TRIVIAL_CONCEPTS = {
     "day","time","man","woman","people","way","thing","place","part","year",
     "yes","no","not","yet","still","back","away","down","up","out","over",
     "never","always","already","once","again","around","together",
+    # Discourse connectors — not domain concepts; score high only because they
+    # appear in almost every sentence of review papers.
+    "likewise","however","therefore","thus","hence","moreover","furthermore",
+    "additionally","consequently","indeed","nevertheless","nonetheless",
+    "similarly","subsequently","accordingly","alternatively","overall",
+    "notably","importantly","specifically","generally","typically","usually",
+    "recently","currently","previously","initially","ultimately","finally",
 }
 
 # ── Document readers ──────────────────────────────────────────────────────────
@@ -523,6 +546,16 @@ _REFERENCES_RE = re.compile(
     r"(?i:literature\s+cited|works\s+cited|bibliography|references\s+cited)"
     r"|\bREFERENCES\b")
 
+# Many academic journals (Nature, Science, Cell) use a numbered reference list
+# without a "REFERENCES" heading — entries look like:
+#   1. Pennisi, E. The CRISPR craze. Science 341, 833–836 (2013).
+#   2. Barrangou, R. et al. CRISPR provides acquired resistance...
+# A run of 5+ such lines in the back 40% of the document is treated as the
+# start of the bibliography.
+_NUMBERED_REF_LINE_RE = re.compile(
+    r"^\s*\d{1,3}\.\s+[A-Z][a-zA-Z'\-]+,\s+[A-Z][\w.']*",
+    re.MULTILINE)
+
 def strip_references(text: str) -> str:
     """Drop a trailing references/bibliography section so cited-author names and
     journal abbreviations ('Ecol', 'Welsh HH') don't swamp entity/relationship
@@ -531,6 +564,13 @@ def strip_references(text: str) -> str:
     for m in _REFERENCES_RE.finditer(text):
         if m.start() >= len(text) * 0.5:
             return text[:m.start()].rstrip()
+    # Fallback: numbered reference list style (Nature, Science, Cell, etc.) that
+    # has no explicit heading. Require 5+ matches so a short numbered list in the
+    # body (e.g., "1. Introduction") never triggers the cut.
+    back_start = int(len(text) * 0.6)
+    matches = list(_NUMBERED_REF_LINE_RE.finditer(text, back_start))
+    if len(matches) >= 5:
+        return text[:matches[0].start()].rstrip()
     return text
 
 # Inline academic citations in the body — the dominant noise source on review
@@ -700,6 +740,19 @@ def parse_document(text: str):
                 # Drop dangling citation fragments ending with "&" ("Burton & Likens &")
                 if t.rstrip().endswith("&"):
                     continue
+                # Drop author-initial citation fragments from numbered reference lists:
+                # "M. Photoactivatable CRISPR" = initial "M." + first word of paper title,
+                # "J.S. Functional" = double-initial + first word, "R.B." = bare initials.
+                # Pattern: one or two initials (e.g. "M." or "J.S.") optionally followed
+                # by at most two more capitalized words — the hallmark of bibliography line
+                # fragments that slip past strip_references() on very short papers.
+                if re.match(r"^[A-Z]\.[A-Z]?\.\s+[A-Z]", t) and len(t.split()) <= 4:
+                    continue
+                if re.match(r"^[A-Z]\.\s+[A-Z][a-z]", t) and len(t.split()) <= 3:
+                    continue
+                # Drop bare author initials like "R.B.", "D.", "S.H."
+                if re.fullmatch(r"[A-Z](?:\.[A-Z])*\.?", t):
+                    continue
                 ent_counter[(t, label)] += 1
                 ent_sents[t.lower()].add(si)
 
@@ -717,10 +770,18 @@ def parse_document(text: str):
                 for s in subjs:
                     st = _clean(" ".join(w.text for w in s.subtree
                                          if w.dep_ not in ("det","punct") and len(w.text) > 1))
+                    # Skip subjects/objects originating from markdown bullet-list
+                    # headers like "Definition :* Trait acquisition..." — these
+                    # come from the Background doc's bold-label + bullet structure
+                    # and produce garbage SVO triples.
+                    if " :* " in st or st.startswith(":* "):
+                        continue
                     for o in objs:
                         o_toks = [w for w in o.subtree
                                   if w.dep_ not in ("det","punct") and len(w.text) > 1][:12]
                         ot = _clean(" ".join(w.text for w in o_toks))
+                        if " :* " in ot or ot.startswith(":* "):
+                            continue
                         if st and ot and len(st) > 2:
                             svo.append({"Subject": st, "Relationship": verb, "Object": ot,
                                         "Rel. Type": "syntactic (SVO)", "Confidence": 65,
@@ -1034,9 +1095,16 @@ def extract_structured(text: str) -> List[Dict]:
         try:
             for m in phonenumbers.PhoneNumberMatcher(text, region):
                 if phonenumbers.is_valid_number(m.number):
+                    raw = m.raw_string
+                    # Reject journal page ranges like "44061–44071": they pass
+                    # US validation because the digit count looks like a phone,
+                    # but they contain an en-dash or em-dash, which real phone
+                    # numbers never do (hyphens are the only valid separator).
+                    if "–" in raw or "—" in raw:
+                        continue
                     e164 = phonenumbers.format_number(
                         m.number, phonenumbers.PhoneNumberFormat.E164)
-                    add("Phone", m.raw_string, e164, _ctx(text, m.start, m.end))
+                    add("Phone", raw, e164, _ctx(text, m.start, m.end))
         except Exception:
             pass
 
@@ -1152,6 +1220,10 @@ def extract_variables(text: str) -> List[Dict]:
                     if re.fullmatch(r"(?:19|20)\d{2}[a-z]?", name): continue
                     if re.fullmatch(r"[\d.]+", name): continue
                     if re.fullmatch(r"[A-Za-z]", val): continue
+                    # Reject values that are bare small integers with no units —
+                    # these are numbered-list item markers ("use: 1", "has: 2"),
+                    # not real variable values.
+                    if re.fullmatch(r"[1-9]", val): continue
                     key = (name.lower()[:30], val[:20])
                     if key not in seen:
                         seen.add(key)
@@ -1171,6 +1243,22 @@ def extract_variables(text: str) -> List[Dict]:
                     seen.add(key)
                     results.append({"Variable / Parameter": param,
                                     "Value": val, "Type": "measurement",
+                                    "Context": _clean(sent)})
+
+    # Molecular-biology inline quantities: "~2,000 genes", "20-nt spacer",
+    # "90% inheritance", "3 base pairs upstream". These don't fit the
+    # name=value pattern but are the primary numerical claims in genomics papers.
+    for sent in sent_tokenize(text):
+        for rx, param in _MOLBIO_INLINE:
+            for m in rx.finditer(sent):
+                val = m.group(1).strip()
+                unit = m.group(2).strip() if len(m.groups()) >= 2 else ""
+                key = (param, val[:30])
+                if key not in seen:
+                    seen.add(key)
+                    results.append({"Variable / Parameter": param,
+                                    "Value": val + (" " + unit if unit else ""),
+                                    "Type": "molecular quantity",
                                     "Context": _clean(sent)})
     return results
 
@@ -1335,6 +1423,8 @@ def build_causal_chains(causal: List[Dict]) -> List[Dict]:
                            "Root Cause": best[0], "Final Outcome": best[-1],
                            "Avg Confidence": round(sum(cs) / len(cs), 1)})
     chains.sort(key=lambda c: (-c["Length"], -c["Avg Confidence"]))
+    # Drop chains whose nodes contain markdown bullet-list artifacts (":*")
+    chains = [c for c in chains if ":*" not in c["Causal Chain"]]
     return chains[:60]
 
 # ── Contradiction detection ─────────────────────────────────────────────────────
