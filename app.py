@@ -813,7 +813,8 @@ def parse_document(text: str):
     return sents, ent_counter, ent_sents, dedup[:300]
 
 # ── Concept extraction: KeyBERT engine + reasoning layer ────────────────────────
-def extract_concepts(text: str, sents: List[str], ent_sents: Dict[str, set]) -> List[Dict]:
+def extract_concepts(text: str, sents: List[str], ent_sents: Dict[str, set],
+                     freq_cutoff: int = 1) -> List[Dict]:
     """KeyBERT discovers candidates; the surrounding layer filters, merges,
     re-ranks, clusters, describes and links them. KeyBERT stays the engine."""
     try:
@@ -905,6 +906,10 @@ def extract_concepts(text: str, sents: List[str], ent_sents: Dict[str, set]) -> 
             rows.append({"_i": i, "Concept": kw, "kb": round(float(kb), 4),
                          "imp": round(float(importance), 1), "freq": int(freq),
                          "ents": ", ".join(rel_ents), "desc": _clean(desc, 200)})
+
+        rows = [r for r in rows if r["freq"] >= freq_cutoff]
+        if not rows:
+            return []
 
         # 5 ── cluster concepts by embedding → name each theme after its top concept
         kept_emb = emb[[r["_i"] for r in rows]]
@@ -2103,7 +2108,8 @@ def analyze():
     combined        = preprocess_text(combined)
     structured      = extract_structured(combined)
     sents, ent_counter, ent_sents, svo = parse_document(combined)
-    concepts        = extract_concepts(combined, sents, ent_sents)
+    freq_cutoff     = max(1, int(request.form.get("concept_freq_cutoff", 1) or 1))
+    concepts        = extract_concepts(combined, sents, ent_sents, freq_cutoff)
     entities        = build_entities(ent_counter, ent_sents, sents, concepts)
     typed_entities  = extract_typed_entities(combined)
     variables       = extract_variables(combined)

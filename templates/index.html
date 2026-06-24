@@ -117,7 +117,13 @@
       <button onclick="clearFiles()"
               class="px-4 py-2 bg-white border border-gray-300 text-gray-500 text-sm
                      font-medium rounded-lg hover:bg-gray-50 transition">Clear All</button>
-      <div class="ml-auto">
+      <div class="ml-auto flex items-center gap-3">
+        <label class="flex items-center gap-2 text-sm text-gray-600 whitespace-nowrap">
+          Min. concept frequency
+          <input id="concept-freq-cutoff" type="number" min="1" value="1"
+                 class="w-16 px-2 py-1 border border-gray-300 rounded-lg text-sm text-center
+                        focus:outline-none focus:ring-2 focus:ring-blue-400">
+        </label>
         <button id="btn-analyze" onclick="runAnalysis()"
                 class="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold
                        text-sm rounded-lg shadow transition disabled:opacity-50
@@ -405,6 +411,7 @@ async function runAnalysis() {
   showProgress(true, 'Uploading files…', 10);
   const fd = new FormData();
   files.forEach(f => fd.append('files', f));
+  fd.append('concept_freq_cutoff', document.getElementById('concept-freq-cutoff').value || '1');
   try {
     showProgress(true, 'Analyzing document(s)…', 35);
     const resp = await fetch('/analyze', { method: 'POST', body: fd });
