@@ -37,6 +37,14 @@ try:
     import ftfy
 except Exception:
     ftfy = None
+
+try:
+    import anthropic as _anthropic
+    _AI_CLIENT = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+except Exception:
+    _anthropic = None
+    _AI_CLIENT = None
+
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -121,7 +129,30 @@ PROBLEM_WORDS = {
     "risk","hazard","unsafe","vulnerable","vulnerability","violation",
     "breach","invalid","incorrect","wrong","timeout","blocked","frozen",
     "deprecated","obsolete","flaw","weakness",
+    # Single-word tokens only — _word_set splits on word boundaries, so multi-word
+    # or hyphenated entries ("off-target", "ethical concern") can never match.
+    "toxicity","immunogenicity","mosaicism",
+    "challenge","challenges","hurdle","hurdles","barrier","barriers",
+    "limitation","limitations","difficulty","difficulties",
+    "drawback","drawbacks","concern","concerns","unintended","ethical",
 }
+
+# Modifiers that, when they precede a problem word, signal the problem is being
+# reduced/avoided rather than asserted ("reduced risk", "prevent infection").
+_MITIGATION_RE_TMPL = (
+    r"\b(?:reduc\w*|lower\w*|lowered|decreas\w*|minimal|minimiz\w*|less|fewer|"
+    r"avoid\w*|prevent\w*|overcom\w*|mitigat\w*|eliminat\w*|free\s+of|"
+    r"no|without)\s+(?:\w+\s+){0,3}?%s\b")
+
+def _problem_words_active(matched: set, srcl: str) -> set:
+    """Drop matched problem words that appear only in a mitigated context
+    ('reduced risk', 'prevent disease') so positive findings aren't flagged."""
+    active = set()
+    for w in matched:
+        if re.search(_MITIGATION_RE_TMPL % re.escape(w), srcl):
+            continue
+        active.add(w)
+    return active
 
 # Subset of PROBLEM_WORDS that escalate a finding to Critical severity. "exploit"
 # is intentionally absent: as a verb it is overwhelmingly benign ("exploit a
@@ -198,36 +229,36 @@ _CAUSAL_CONF = {
 }
 
 CAUSAL_PATTERNS: List[Tuple[str, str]] = [
-    (r"(\w[\w\s]{1,40}?)\s+causes?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "causes"),
-    (r"(\w[\w\s]{1,40}?)\s+leads?\s+to\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "leads to"),
-    (r"(\w[\w\s]{1,40}?)\s+results?\s+in\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "results in"),
-    (r"(\w[\w\s]{1,40}?)\s+triggers?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "triggers"),
-    (r"(\w[\w\s]{1,40}?)\s+depends?\s+on\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "depends on"),
-    (r"(\w[\w\s]{1,40}?)\s+requires?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "requires"),
-    (r"(\w[\w\s]{1,40}?)\s+affects?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "affects"),
-    (r"(\w[\w\s]{1,40}?)\s+impacts?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "impacts"),
-    (r"(\w[\w\s]{1,40}?)\s+prevents?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "prevents"),
-    (r"(\w[\w\s]{1,40}?)\s+enables?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "enables"),
-    (r"(\w[\w\s]{1,40}?)\s+blocks?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "blocks"),
-    (r"if\s+(\w[\w\s]{1,40}?),?\s+then\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "if → then"),
-    (r"(\w[\w\s]{1,40}?)\s+is\s+caused\s+by\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "caused by"),
-    (r"(\w[\w\s]{1,40}?)\s+is\s+due\s+to\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "due to"),
-    (r"(\w[\w\s]{1,40}?)\s+is\s+associated\s+with\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "associated with"),
-    (r"(\w[\w\s]{1,40}?)\s+represents?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "represents"),
-    (r"(\w[\w\s]{1,40}?)\s+symbolizes?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "symbolizes"),
-    (r"(\w[\w\s]{1,40}?)\s+explores?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "explores"),
-    (r"(\w[\w\s]{1,40}?)\s+faces?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "faces"),
-    (r"(\w[\w\s]{1,40}?)\s+carries?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "carries"),
-    (r"(\w[\w\s]{1,40}?)\s+reflects?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "reflects"),
-    (r"(\w[\w\s]{1,40}?)\s+reveals?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "reveals"),
-    (r"(\w[\w\s]{1,40}?)\s+shows?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "shows"),
-    (r"(\w[\w\s]{1,40}?)\s+demands?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "demands"),
-    (r"(\w[\w\s]{1,40}?)\s+extracts?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "extracts"),
-    (r"(\w[\w\s]{1,40}?)\s+share[sd]?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "shares"),
-    (r"(\w[\w\s]{1,40}?)\s+enters?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "enters"),
-    (r"(\w[\w\s]{1,40}?)\s+reclaims?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "reclaims"),
-    (r"(\w[\w\s]{1,40}?)\s+recognizes?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "recognizes"),
-    (r"(\w[\w\s]{1,40}?)\s+escapes?\s+(\w[\w\s]{1,40}?)(?=[,.\n]|$)", "escapes"),
+    (r"\b(\w[\w\s]{1,60}?)\s+causes?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "causes"),
+    (r"\b(\w[\w\s]{1,60}?)\s+leads?\s+to\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "leads to"),
+    (r"\b(\w[\w\s]{1,60}?)\s+results?\s+in\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "results in"),
+    (r"\b(\w[\w\s]{1,60}?)\s+triggers?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "triggers"),
+    (r"\b(\w[\w\s]{1,60}?)\s+depends?\s+on\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "depends on"),
+    (r"\b(\w[\w\s]{1,60}?)\s+requires?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "requires"),
+    (r"\b(\w[\w\s]{1,60}?)\s+affects?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "affects"),
+    (r"\b(\w[\w\s]{1,60}?)\s+impacts?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "impacts"),
+    (r"\b(\w[\w\s]{1,60}?)\s+prevents?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "prevents"),
+    (r"\b(\w[\w\s]{1,60}?)\s+enables?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "enables"),
+    (r"\b(\w[\w\s]{1,60}?)\s+blocks?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "blocks"),
+    (r"if\s+\b(\w[\w\s]{1,60}?),?\s+then\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "if → then"),
+    (r"\b(\w[\w\s]{1,60}?)\s+is\s+caused\s+by\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "caused by"),
+    (r"\b(\w[\w\s]{1,60}?)\s+is\s+due\s+to\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "due to"),
+    (r"\b(\w[\w\s]{1,60}?)\s+is\s+associated\s+with\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "associated with"),
+    (r"\b(\w[\w\s]{1,60}?)\s+represents?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "represents"),
+    (r"\b(\w[\w\s]{1,60}?)\s+symbolizes?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "symbolizes"),
+    (r"\b(\w[\w\s]{1,60}?)\s+explores?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "explores"),
+    (r"\b(\w[\w\s]{1,60}?)\s+faces?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "faces"),
+    (r"\b(\w[\w\s]{1,60}?)\s+carries?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "carries"),
+    (r"\b(\w[\w\s]{1,60}?)\s+reflects?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "reflects"),
+    (r"\b(\w[\w\s]{1,60}?)\s+reveals?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "reveals"),
+    (r"\b(\w[\w\s]{1,60}?)\s+shows?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "shows"),
+    (r"\b(\w[\w\s]{1,60}?)\s+demands?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "demands"),
+    (r"\b(\w[\w\s]{1,60}?)\s+extracts?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "extracts"),
+    (r"\b(\w[\w\s]{1,60}?)\s+share[sd]?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "shares"),
+    (r"\b(\w[\w\s]{1,60}?)\s+enters?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "enters"),
+    (r"\b(\w[\w\s]{1,60}?)\s+reclaims?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "reclaims"),
+    (r"\b(\w[\w\s]{1,60}?)\s+recognizes?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "recognizes"),
+    (r"\b(\w[\w\s]{1,60}?)\s+escapes?\s+\b(\w[\w\s]{1,60}?)(?=[,.\n]|$)", "escapes"),
 ]
 
 # Scientific density/biomass patterns used alongside VARIABLE_PATTERNS.
@@ -251,8 +282,8 @@ _BIOUNIT_RE = re.compile(
 # inheritance/efficiency percentages. Each entry: (compiled-regex, param-name).
 # Group 1 = value (number), Group 2 = unit label.
 _MOLBIO_INLINE = [
-    (re.compile(r"(~?[\d,]+(?:\.\d+)?)\s+(genes?)\b", re.I), "gene count"),
-    (re.compile(r"(~?[\d,]+(?:\.\d+)?)\s+(base\s+pairs?|bp)\b", re.I), "sequence length (bp)"),
+    (re.compile(r"(~?\d[\d,]*(?:\.\d+)?)\s+(genes?)\b", re.I), "gene count"),
+    (re.compile(r"(~?\d[\d,]*(?:\.\d+)?)\s+(base\s+pairs?|bp)\b", re.I), "sequence length (bp)"),
     (re.compile(r"(\d+)[\-–]nt\b", re.I), "sequence length (nt)"),
     (re.compile(r"(\d+)\s+(nt)\b(?:\s+(?:spacer|target|recognition|seed|guide|protospacer))", re.I), "spacer length"),
     (re.compile(r"(>?\s*\d+(?:\.\d+)?)\s*(%)\s*(?:of\s+[\w\s]{1,30})?(?=\s+(?:inheritance|efficiency|accuracy|specificity|off.target|success|edit|correct))", re.I), "efficiency/rate"),
@@ -325,6 +356,35 @@ def _looks_proper(text: str) -> bool:
     somewhere ("John", "iPhone", "eBay"); pure lower-case spans are misfires."""
     return any(c.isupper() for c in text)
 
+def _is_noise_entity(t: str) -> bool:
+    """True for PDF-extraction artefacts that should never be entities:
+    citation fragments, scrambled small-caps, figure/axis labels."""
+    s = t.strip()
+    if not s:
+        return True
+    # Citation-paren artefacts: ")" immediately followed by a number ("R.B.)92").
+    if re.search(r"\)\s*\d", s):
+        return True
+    # Word glued to a 3+-digit citation number ("Sau180,181", "iPSCs104").
+    if re.search(r"[A-Za-z]\d{3,}(?:[,–]\d+)*\s*$", s):
+        return True
+    # Markdown bullet-list heading fragment ("RNA - Recognizes").
+    if " - " in s:
+        return True
+    # Chart axis label with two or more 4-digit years ("2014 2015 Year").
+    if len(re.findall(r"\b(?:19|20)\d{2}\b", s)) >= 2:
+        return True
+    toks = s.split()
+    # All tokens are single characters / figure labels ("L L", "1 S.").
+    if toks and all(re.fullmatch(r"[A-Za-z0-9]\.?", w) for w in toks):
+        return True
+    # Scrambled small-caps from PDF ("FInAncIAl InteRests") — a word with two or
+    # more lower→upper case transitions (legit camelCase has at most one).
+    for w in toks:
+        if sum(1 for a, b in zip(w, w[1:]) if a.islower() and b.isupper()) >= 2:
+            return True
+    return False
+
 # Pronouns and relativisers must never anchor an SVO triple. As a subject/object
 # they collapse many unrelated sentences onto one meaningless hub ("they", "it",
 # "that", "which") that then dominates the knowledge graph as the biggest node.
@@ -366,6 +426,13 @@ _TRIVIAL_CONCEPTS = {
     "similarly","subsequently","accordingly","alternatively","overall",
     "notably","importantly","specifically","generally","typically","usually",
     "recently","currently","previously","initially","ultimately","finally",
+}
+
+# Trailing verbs that turn a 2-word KeyBERT phrase into a clause fragment rather
+# than a noun-phrase concept ("applications include", "understanding led").
+_CONCEPT_VERB_TAIL = {
+    "include","includes","included","led","leads","defining","define","defined",
+    "enabling","showed","showing","requiring","requires","provides","providing",
 }
 
 # ── Document readers ──────────────────────────────────────────────────────────
@@ -437,7 +504,11 @@ def chunk_text(text: str, max_chunk: int = 80_000) -> List[str]:
     return chunks or [text[:max_chunk]]
 
 def _clean(text: str, n: int = 200) -> str:
-    return re.sub(r"\s+", " ", text).strip()[:n]
+    t = re.sub(r"\s+", " ", text).strip()
+    if len(t) <= n:
+        return t
+    cut = t.rfind(" ", 0, n)
+    return (t[:cut] if cut > 0 else t[:n]) + "…"
 
 _LEADING_FLUFF = re.compile(
     r"^(?:the|a|an|and|but|or|nor|so|then|thus|hence|therefore|however|this|that|"
@@ -733,6 +804,10 @@ def parse_document(text: str):
             for ent in sent.ents:
                 t = ent.text.strip(); label = ent.label_
                 if len(t) <= 1: continue
+                # Drop PDF-extraction noise (citation fragments, scrambled caps,
+                # figure/axis labels) before it pollutes the entity table.
+                if _is_noise_entity(t):
+                    continue
                 # Drop bare numerals/values (CARDINAL "four", PERCENT, MONEY…) —
                 # noise here, and already in the Structured Data tab.
                 if label in _NOISE_ENTITY_LABELS:
@@ -842,6 +917,12 @@ def extract_concepts(text: str, sents: List[str], ent_sents: Dict[str, set],
             if re.fullmatch(r'[\d\s,.\-]+', kw): continue
             if len(words) == 1 and len(kw) <= 2: continue
             if all(w in STOPWORDS for w in words): continue
+            # Drop clause fragments masquerading as concepts: a 2-word phrase whose
+            # second word is a verb ("applications include", "understanding led") or
+            # whose first word is an -ly adverb ("predictably defining").
+            if len(words) == 2 and (words[-1] in _CONCEPT_VERB_TAIL
+                                    or words[0].endswith("ly")):
+                continue
             # Concepts should be 1-2 words. Allow 3+ only for proper names where
             # a non-first token is capitalised ("Eastern Red-backed Salamander",
             # "Great Smoky Mountains"). Generic 3-word phrases are trimmed to 2.
@@ -1012,6 +1093,227 @@ def build_entities(ent_counter: Counter, ent_sents: Dict[str, set],
                     "Occurrences": e["count"], "Context": e["desc"]})
     return out
 
+# ── AI entity relabelling ────────────────────────────────────────────────────────
+
+# spaCy label types that are commonly wrong in scientific / technical documents.
+_SPACY_GENERIC = {"PERSON", "NORP", "ORG", "WORK_OF_ART", "EVENT", "FAC", "PRODUCT"}
+
+_AI_RELABEL_PROMPT = """\
+You are a named-entity type corrector for a scientific NLP pipeline.
+spaCy has assigned generic labels (PERSON, ORG, NORP, WORK_OF_ART, EVENT, FAC)
+to the entities below. Many of these are wrong in a scientific document context
+(e.g. CRISPR is labelled PERSON, Cas9 is labelled NORP).
+
+For each entity, decide the single best domain label from this list:
+  PROTEIN          — protein, enzyme, Cas9, dCas9, SpyCas9, Cpf1, polymerase
+  GENE             — specific gene name (e.g. TP53, BRCA1, EMX1)
+  GENE_SYSTEM      — CRISPR, CRISPR-Cas9, CRISPRi, CRISPRa (gene-editing system)
+  PATHWAY          — NHEJ, HDR, MMR, apoptosis, signalling pathway
+  SEQUENCE         — PAM, protospacer, guide RNA, sgRNA, tracrRNA (nucleic-acid motif)
+  DISEASE          — disease, disorder, syndrome, cancer, muscular dystrophy
+  ORGANISM         — species, bacterium, virus, cell line
+  TECHNOLOGY       — ZFN, TALEN, PCR, sequencing method, delivery vehicle
+  CHEMICAL         — drug, compound, reagent, small molecule
+  INSTITUTION      — university, company, research institute (real organisations)
+  PUBLISHER        — journal, publisher (Nature, Science, Cell Press)
+  PERSON           — keep only if it is genuinely a human individual
+  ORG              — keep only if it is a real organisation not better described above
+  GPE              — country, city, region
+  OTHER            — if none of the above fit
+
+Return ONLY a JSON object mapping the exact entity text to its new label.
+Do NOT include entities whose current label is already correct.
+Do NOT add explanation or markdown fences.
+
+Example output:
+{
+  "CRISPR": "GENE_SYSTEM",
+  "Cas9": "PROTEIN",
+  "NHEJ": "PATHWAY",
+  "PAM": "SEQUENCE",
+  "Duchenne muscular dystrophy": "DISEASE",
+  "Nature America, Inc.": "PUBLISHER",
+  "CRISPR-Cas9": "GENE_SYSTEM"
+}
+
+Entities to classify (text | current_label | context):
+"""
+
+# Human-readable descriptions for domain labels (replaces spacy.explain for new types).
+_DOMAIN_LABEL_DESC = {
+    "PROTEIN":     "Protein or enzyme",
+    "GENE":        "Gene",
+    "GENE_SYSTEM": "Gene-editing system",
+    "PATHWAY":     "Biological pathway",
+    "SEQUENCE":    "Nucleic-acid sequence or motif",
+    "DISEASE":     "Disease or disorder",
+    "ORGANISM":    "Organism or species",
+    "TECHNOLOGY":  "Technology or method",
+    "CHEMICAL":    "Chemical compound or drug",
+    "INSTITUTION": "Institution or organisation",
+    "PUBLISHER":   "Publisher or journal",
+    "OTHER":       "Other",
+}
+
+
+# Corpus sentences used to anchor each domain label in embedding space.
+# Rich, diverse phrasing improves centroid quality for all-MiniLM-L6-v2.
+_LABEL_CORPUS: Dict[str, str] = {
+    "PROTEIN":     (
+        "protein enzyme Cas9 dCas9 SpyCas9 Cpf1 Cas12 polymerase nuclease "
+        "amino acid residue transcription factor kinase ligase helicase"),
+    "GENE":        (
+        "gene name locus allele TP53 BRCA1 EMX1 HBB dystrophin exon intron "
+        "coding sequence mutation variant"),
+    "GENE_SYSTEM": (
+        "CRISPR CRISPR-Cas9 CRISPRi CRISPRa base editor prime editor "
+        "epigenome editor genome engineering gene drive"),
+    "PATHWAY":     (
+        "NHEJ HDR MMR apoptosis signalling pathway DNA repair mechanism "
+        "homologous recombination mismatch repair non-homologous end joining"),
+    "SEQUENCE":    (
+        "PAM protospacer guide RNA sgRNA tracrRNA crRNA gRNA nucleic acid "
+        "sequence motif oligonucleotide spacer scaffold"),
+    "DISEASE":     (
+        "disease disorder syndrome cancer muscular dystrophy Duchenne "
+        "infection mutation pathology sickle cell anaemia tumour genetic condition"),
+    "ORGANISM":    (
+        "plant species bacterium virus cell line genus organism E. coli "
+        "S. cerevisiae Nicotiana Arabidopsis Drosophila zebrafish mouse "
+        "human tobacco cotton wheat rice crop flora fauna"),
+    "TECHNOLOGY":  (
+        "ZFN TALEN PCR sequencing method delivery nanoparticle electroporation "
+        "technique assay tool instrument platform CRISPRainbow fluorescent labeling"),
+    "CHEMICAL":    (
+        "drug compound reagent small molecule inhibitor substrate buffer "
+        "antibiotic nucleotide plasmid vector lipid"),
+    "INSTITUTION": (
+        "university hospital company research institute foundation laboratory "
+        "Broad Institute Wellcome Sanger MIT Harvard"),
+    "PUBLISHER":   (
+        "journal publisher academic press Nature America Science Cell Press "
+        "Springer Elsevier Wiley NEJM Lancet PNAS eLife conference proceedings"),
+}
+
+# Hardcoded type corrections for well-known entities that embeddings consistently
+# misclassify due to name ambiguity (e.g. "Nature America" embeds near gene-editing
+# rather than publishing; plant genera embed near CRISPR-related corpus).
+_ENTITY_OVERRIDES: Dict[str, str] = {
+    "nature america, inc.":          "PUBLISHER",
+    "nature america":                 "PUBLISHER",
+    "nature publishing group":        "PUBLISHER",
+    "nicotiana":                      "ORGANISM",
+    "arabidopsis":                    "ORGANISM",
+    "drosophila":                     "ORGANISM",
+    "crisprainbow":                   "TECHNOLOGY",
+    "crisprrainbow":                  "TECHNOLOGY",
+    "duchenne muscular dystrophy":    "DISEASE",
+    "becker muscular dystrophy":      "DISEASE",
+}
+
+# Pre-compute label embeddings once at module load (384-dim, float32).
+_LABEL_EMBS: np.ndarray = np.zeros((len(_LABEL_CORPUS), 384), dtype="float32")
+_LABEL_NAMES: List[str] = list(_LABEL_CORPUS.keys())
+
+def _ensure_label_embs() -> None:
+    """Lazy-initialise label embeddings on first call (avoids startup cost)."""
+    global _LABEL_EMBS
+    if _LABEL_EMBS.any():
+        return
+    _LABEL_EMBS = _embed(list(_LABEL_CORPUS.values()))
+
+def embed_relabel_entities(entities: List[Dict]) -> List[Dict]:
+    """
+    Re-type spaCy generic entity labels using sentence-embedding cosine similarity.
+    Compares each entity's text + context against rich domain-label descriptions.
+    No API key required — uses the already-loaded KW_MODEL / all-MiniLM-L6-v2.
+
+    Override table (_ENTITY_OVERRIDES) is applied first for entities that the
+    embedding consistently misclassifies due to name ambiguity.
+    """
+    candidates = [e for e in entities if e.get("Type", "") in _SPACY_GENERIC]
+    if not candidates:
+        return entities
+
+    # Pass 1: exact override table (fast, no embedding needed).
+    remaining = []
+    for e in candidates:
+        key = e["Entity"].lower().strip()
+        if key in _ENTITY_OVERRIDES:
+            e["Type"] = _ENTITY_OVERRIDES[key]
+            e["Description"] = _DOMAIN_LABEL_DESC.get(e["Type"], e["Type"])
+        else:
+            remaining.append(e)
+
+    if not remaining:
+        return entities
+
+    # Pass 2: cosine similarity for everything not in the override table.
+    _ensure_label_embs()
+    texts = [
+        f"{e['Entity']} {e.get('Context', '')[:80]}"
+        for e in remaining
+    ]
+    ent_emb = _embed(texts)                              # (n_ents, 384)
+    sim = cosine_similarity(ent_emb, _LABEL_EMBS)        # (n_ents, n_labels)
+
+    for i, e in enumerate(remaining):
+        best_j = int(np.argmax(sim[i]))
+        best_score = float(sim[i][best_j])
+        if best_score >= 0.38:                           # conservative threshold
+            new_type = _LABEL_NAMES[best_j]
+            e["Type"] = new_type
+            e["Description"] = _DOMAIN_LABEL_DESC.get(new_type, new_type)
+
+    return entities
+
+
+def ai_relabel_entities(entities: List[Dict], combined: str) -> List[Dict]:
+    """
+    Correct spaCy's generic entity labels with domain-appropriate types.
+
+    Primary path: ask Claude Haiku (requires ANTHROPIC_API_KEY).
+    Fallback:     embedding cosine-similarity against domain-label corpus
+                  (uses the already-loaded all-MiniLM-L6-v2, no API key needed).
+    """
+    if _AI_CLIENT is None or not os.environ.get("ANTHROPIC_API_KEY", ""):
+        return embed_relabel_entities(entities)
+
+    candidates = [e for e in entities if e.get("Type", "") in _SPACY_GENERIC]
+    if not candidates:
+        return entities
+
+    try:
+        lines = "\n".join(
+            f'{e["Entity"]} | {e["Type"]} | {e.get("Context", "")[:120]}'
+            for e in candidates[:80]   # cap to avoid prompt overflow
+        )
+        msg = _AI_CLIENT.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": _AI_RELABEL_PROMPT + lines
+            }]
+        )
+        raw = msg.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+        patch: Dict[str, str] = json.loads(raw)
+
+        # Apply the corrections
+        patch_lower = {k.lower(): v for k, v in patch.items()}
+        for e in entities:
+            new_type = patch_lower.get(e["Entity"].lower())
+            if new_type:
+                e["Type"] = new_type
+                e["Description"] = _DOMAIN_LABEL_DESC.get(new_type, new_type)
+
+    except Exception:
+        pass  # any failure → return original list unchanged
+
+    return entities
+
 # ── Structured deterministic extractors (regex + validating libraries) ──────────
 # High-precision, deterministic, offline. Each candidate is validated/normalised
 # by a purpose-built library so a greedy pattern can stay high-recall without
@@ -1046,6 +1348,15 @@ _DURATION_RE = re.compile(
 # Acronym definition: "Full Term Here (FTH)" — keep only when initials roughly match.
 _ACRONYM_RE  = re.compile(
     r"\b((?:[A-Z][A-Za-z0-9]*\W+){1,6}[A-Za-z0-9]+)\s+\(([A-Z][A-Z0-9]{1,6})s?\)")
+# Wider form: lowercase full term + parenthetical abbreviation, allowing
+# mixed-case abbreviations with a short lowercase prefix ("single guide RNA
+# (sgRNA)", "deactivated variants of Cas9 (dCas9)", "zinc-finger nucleases (ZFNs)").
+_ACRONYM_RE2 = re.compile(
+    r"\b([a-z][a-zA-Z0-9\s\-]{3,60}?)\s+\(((?:[a-z]{1,3})?[A-Z][A-Za-z0-9]{1,8})s?\)")
+# Explicit definitional form: "ZFN stands for zinc finger nuclease"
+_ACRONYM_STANDS_RE = re.compile(
+    r"\b([A-Z][A-Z0-9]{1,7})\s+(?:stands for|is (?:an? )?(?:abbreviation|acronym)"
+    r"(?:\s+for)?|is short for|refers to)\s+([^.;,]{5,80})", re.I)
 _DATE_RE     = re.compile(
     r"\b(?:\d{4}-\d{2}-\d{2}"                                            # ISO 2024-03-14
     r"|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"                                    # 03/14/2024
@@ -1067,6 +1378,30 @@ def _acronym_phrase(initials: str, phrase: str) -> Optional[str]:
     tail = words[-k:]
     if "".join(w[0] for w in tail).upper() == initials.upper():
         return " ".join(tail)
+    return None
+
+def _sh_expansion(abbr: str, phrase: str) -> Optional[str]:
+    """Schwartz-Hearst expansion matching: the shortest trailing word-span of
+    `phrase` whose characters contain `abbr`'s letters in order, with the first
+    abbreviation letter aligned to the start of the first word. This is laxer than
+    word-initials, so it catches "non-homologous endjoining (NHEJ)" and
+    "single guide RNA (sgRNA)" where letters span merged/hyphenated words."""
+    words = re.findall(r"[A-Za-z0-9&]+", phrase)
+    al = re.sub(r"[^a-z0-9]", "", abbr.lower())
+    if len(al) < 2 or not words:
+        return None
+    max_n = min(len(words), len(al) + 2)
+    for n in range(1, max_n + 1):
+        cand = words[-n:]
+        if cand[0][0].lower() != al[0]:
+            continue
+        flat = "".join(cand).lower()
+        i = 0
+        for ch in flat:
+            if i < len(al) and ch == al[i]:
+                i += 1
+        if i == len(al):
+            return " ".join(cand)
     return None
 
 _CURR_MULT = [("thousand", 1e3), ("million", 1e6), ("billion", 1e9),
@@ -1178,10 +1513,36 @@ def extract_structured(text: str) -> List[Dict]:
         add("Statistic", m.group(0), "", _ctx(text, *m.span()))
 
     # Acronyms + expansion (Schwartz-Hearst-style, initials must trace the phrase)
+    seen_abbr: set = set()
     for m in _ACRONYM_RE.finditer(text):
         exp = _acronym_phrase(m.group(2), m.group(1))
         if exp:
+            seen_abbr.add(m.group(2))
             add("Acronym", m.group(2), exp, _ctx(text, *m.span()))
+
+    # Wider pass: lowercase/hyphenated full terms e.g. "non-homologous endjoining
+    # (NHEJ)", "single guide RNA (sgRNA)". Uses Schwartz-Hearst char matching.
+    for m in _ACRONYM_RE2.finditer(text):
+        abbr = m.group(2)
+        # Strip a captured plural s from an all-caps abbreviation ("ZFNs" → "ZFN").
+        if abbr.endswith("s") and abbr[:-1].isupper():
+            abbr = abbr[:-1]
+        if abbr in seen_abbr:
+            continue
+        exp = _sh_expansion(abbr, m.group(1))
+        if exp:
+            seen_abbr.add(abbr)
+            add("Acronym", abbr, exp, _ctx(text, *m.span()))
+
+    # Explicit definitions: "ZFN stands for zinc finger nuclease"
+    for m in _ACRONYM_STANDS_RE.finditer(text):
+        abbr = m.group(1)
+        if abbr in seen_abbr:
+            continue
+        expansion = m.group(2).strip().rstrip(".,;")
+        if len(expansion) > 4:
+            seen_abbr.add(abbr)
+            add("Acronym", abbr, expansion, _ctx(text, *m.span()))
 
     type_order = {t: i for i, t in enumerate(
         ["Email", "Phone", "URL", "Social Handle", "Hashtag", "Date", "Duration",
@@ -1247,6 +1608,10 @@ def extract_variables(text: str) -> List[Dict]:
                     # these are numbered-list item markers ("use: 1", "has: 2"),
                     # not real variable values.
                     if re.fullmatch(r"[1-9]", val): continue
+                    # Reject pure-punctuation names or values — parsing artefacts
+                    # like ", gene" (name = ",", value = "gene").
+                    if re.fullmatch(r"[\s,.\-;:!?()–—]+", name): continue
+                    if re.fullmatch(r"[\s,.\-;:!?()–—]+", val): continue
                     key = (name.lower()[:30], val[:20])
                     if key not in seen:
                         seen.add(key)
@@ -1524,16 +1889,28 @@ def detect_contradictions(rels: List[Dict], variables: List[Dict],
     out, seen = [], set()
 
     # 1 ── same variable assigned different values
+    # Track (value, context) so we can compare surrounding text: if the two
+    # occurrences appear in very different sentences they likely refer to different
+    # entities (e.g. "20 nt seed" vs "80 nt full guide") and the conflict is weak.
     byname: Dict[str, list] = defaultdict(list)
     for v in variables:
-        vals = byname[v["Variable / Parameter"].lower()]
-        if v["Value"] not in vals:
-            vals.append(v["Value"])
-    for name, vals in byname.items():
-        if len(vals) > 1:
-            out.append({"Statement A": f"{name} = {vals[0]}",
-                        "Statement B": f"{name} = {vals[1]}",
-                        "Conflict Type": "variable value conflict", "Severity": "Medium"})
+        key = v["Variable / Parameter"].lower()
+        val = v["Value"]; ctx = v.get("Context", "")
+        if val not in [e[0] for e in byname[key]]:
+            byname[key].append((val, ctx))
+    for name, entries in byname.items():
+        if len(entries) > 1:
+            val0, ctx0 = entries[0]; val1, ctx1 = entries[1]
+            words0 = set(re.findall(r"\b[a-z]{4,}\b", ctx0.lower()))
+            words1 = set(re.findall(r"\b[a-z]{4,}\b", ctx1.lower()))
+            overlap = len(words0 & words1) / max(len(words0 | words1), 1)
+            # Low overlap → the two values appear in different contexts →
+            # likely different entities, not a real contradiction.
+            severity = "Medium" if overlap >= 0.15 else "Low"
+            out.append({"Statement A": f"{name} = {val0}",
+                        "Statement B": f"{name} = {val1}",
+                        "Conflict Type": "variable value conflict",
+                        "Severity": severity})
 
     # 2 ── affirmation/negation + opposing-predicate conflicts on the same pair
     anti: Dict[str, str] = {}
@@ -1606,6 +1983,214 @@ def detect_assumptions(sents: List[str]) -> List[Dict]:
     out.sort(key=lambda a: -a["Confidence"])
     return out[:60]
 
+# ── Post-processing: dedup + AI enrichment ──────────────────────────────────────
+
+def clean_problem_subject(subject: str) -> str:
+    """Normalise a problem Subject string: strip leading garbage and trailing punctuation."""
+    subject = re.sub(r"^[^a-zA-Z0-9]+", "", subject)   # leading non-alphanumeric
+    subject = re.sub(r"[.,;:]+$", "", subject)           # trailing punctuation
+    return subject.strip()
+
+
+def _dedup_problems(problems: List[Dict]) -> List[Dict]:
+    """
+    Clean and deduplicate the problems list.
+
+    1. Runs every Subject through clean_problem_subject() to fix truncation
+       artefacts (e.g. "efore antimicrobials…" → "antimicrobials…").
+    2. Deduplicates by (normalised_subject, normalised_object) so near-identical
+       entries produced from the same source sentence collapse into one.
+    """
+    seen: set = set()
+    out: List[Dict] = []
+    for p in problems:
+        cleaned = clean_problem_subject(p.get("Subject", ""))
+        subj_norm = cleaned.lower()[:50]
+        obj_norm  = p.get("Object", "").lower().strip()[:50]
+        key = (subj_norm, obj_norm)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(p, **{"Subject": cleaned or p.get("Subject", "")}))
+    return out
+
+
+def embed_dedup_problems(problems: List[Dict]) -> List[Dict]:
+    """
+    Semantic deduplication of problems using sentence embeddings.
+
+    Embeds (Subject + Relationship + Object) for every entry, then union-finds
+    clusters whose cosine similarity ≥ 0.85. Within each cluster the entry with
+    the highest Severity (High > Medium > Low) — or longest Subject if tied — is
+    kept and the rest are dropped.
+
+    No API key required — uses the already-loaded all-MiniLM-L6-v2.
+    """
+    if len(problems) < 2:
+        return problems
+
+    _SEV_RANK = {"High": 3, "Medium": 2, "Low": 1}
+
+    phrases = [
+        f"{p.get('Subject','')} {p.get('Relationship','')} {p.get('Object','')}"
+        for p in problems
+    ]
+    emb = _embed(phrases)
+    sim = cosine_similarity(emb)          # (n, n)
+
+    # Union-find
+    parent = list(range(len(problems)))
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    def _union(i: int, j: int) -> None:
+        ri, rj = _find(i), _find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    n = len(problems)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if sim[i][j] >= 0.85:
+                _union(i, j)
+
+    # Per cluster: pick the entry with highest severity, longest subject as tiebreak.
+    best: Dict[int, int] = {}
+    for i, p in enumerate(problems):
+        root = _find(i)
+        if root not in best:
+            best[root] = i
+        else:
+            prev = problems[best[root]]
+            cur_rank  = _SEV_RANK.get(p.get("Severity", ""), 0)
+            prev_rank = _SEV_RANK.get(prev.get("Severity", ""), 0)
+            if cur_rank > prev_rank or (
+                cur_rank == prev_rank and
+                len(p.get("Subject", "")) > len(prev.get("Subject", ""))
+            ):
+                best[root] = i
+
+    keep = set(best.values())
+    return [p for i, p in enumerate(problems) if i in keep]
+
+
+_AI_POSTPROCESS_PROMPT = """\
+You are a post-processing validator for a document analysis NLP pipeline.
+You will be given:
+  1. A JSON list of extracted problems (each has Subject, Relationship, Object, Severity, Type, Source Sentence).
+  2. A JSON list of already-detected acronyms (each has Value, Detail).
+  3. The first 6 000 characters of the source document.
+
+Your job is to return ONLY valid JSON (no markdown, no explanation) with exactly these three keys:
+
+{
+  "add_problems": [
+    {
+      "Subject": "...",
+      "Relationship": "...",
+      "Object": "...",
+      "Severity": "High",
+      "Type": "limitation",
+      "Source Sentence": "exact sentence from the text, max 200 chars"
+    }
+  ],
+  "add_acronyms": [
+    { "acronym": "NHEJ", "expansion": "non-homologous end joining" }
+  ],
+  "remove_problem_subjects": ["exact Subject string of duplicate/artefact entries to remove"]
+}
+
+Rules:
+- add_problems: only real limitations, risks, or challenges explicitly stated in the source text
+  that are NOT already represented in the problems list. Use Severity "High" for explicit
+  limitations ("cannot", "fails", "challenge", "risk"), "Medium" for implicit ones.
+- add_acronyms: only acronyms that appear in the source text but are MISSING from the
+  already-detected list. Infer the expansion from context if it appears anywhere in the text.
+- remove_problem_subjects: Subject strings of entries that are duplicates or artefacts
+  (e.g. leading truncation fragments like "efore antimicrobials based on CRISPRs").
+- If there is nothing to add or remove for a key, return an empty list [].
+- Do NOT invent content not present in the source text.
+"""
+
+
+def ai_postprocess(problems: List[Dict], structured: List[Dict],
+                   combined: str) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Post-process problems and structured data.
+
+    Step 1 (always, no API key needed):
+      Semantic deduplication of problems via sentence-embedding cosine similarity.
+
+    Step 2 (requires ANTHROPIC_API_KEY):
+      Ask Claude to find missing High/Medium problems, extra acronyms, and
+      remove truncation-artifact duplicate subjects.
+    """
+    # Always run embedding-based semantic dedup (uses KW_MODEL, no API needed).
+    problems = embed_dedup_problems(problems)
+
+    if _AI_CLIENT is None or not os.environ.get("ANTHROPIC_API_KEY", ""):
+        return problems, structured
+
+    try:
+        existing_acronyms = [
+            {"Value": r["Value"], "Detail": r.get("Detail", "")}
+            for r in structured if r.get("Type") == "Acronym"
+        ]
+        payload = {
+            "problems":  problems[:60],
+            "acronyms":  existing_acronyms,
+            "source":    combined[:6_000],
+        }
+        msg = _AI_CLIENT.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": _AI_POSTPROCESS_PROMPT + "\n\n" + json.dumps(payload, ensure_ascii=False)
+            }]
+        )
+        raw = msg.content[0].text.strip()
+        # Strip accidental markdown fences
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+        patch = json.loads(raw)
+
+        # Apply removals
+        remove_set = {s.lower().strip() for s in patch.get("remove_problem_subjects", [])}
+        if remove_set:
+            problems = [p for p in problems
+                        if p.get("Subject", "").lower().strip() not in remove_set]
+
+        # Merge new problems (skip if Subject+Object already present)
+        existing_keys = {
+            (p.get("Subject", "").lower()[:50], p.get("Object", "").lower()[:50])
+            for p in problems
+        }
+        for np_ in patch.get("add_problems", []):
+            key = (np_.get("Subject", "").lower()[:50], np_.get("Object", "").lower()[:50])
+            if key not in existing_keys:
+                existing_keys.add(key)
+                problems.append(np_)
+
+        # Merge new acronyms into structured
+        existing_abbr = {r["Value"].upper() for r in structured if r.get("Type") == "Acronym"}
+        for na in patch.get("add_acronyms", []):
+            abbr = na.get("acronym", "").strip().upper()
+            exp  = na.get("expansion", "").strip()
+            if abbr and exp and abbr not in existing_abbr:
+                existing_abbr.add(abbr)
+                structured.append({
+                    "Type": "Acronym", "Value": abbr, "Detail": exp,
+                    "Context": "[AI-inferred from source text]"
+                })
+
+    except Exception:
+        pass  # any failure → return original unchanged
+
+    return problems, structured
+
 # ── Problem detection (severity tiers + root causes + affected entities) ─────────
 def identify_problems(rels: List[Dict], entities: List[Dict], text: str,
                       sents: List[str], causal: List[Dict]) -> List[Dict]:
@@ -1637,11 +2222,11 @@ def identify_problems(rels: List[Dict], entities: List[Dict], text: str,
 
         if SECURITY_WORDS & triple_w:
             sev, ptype = "Critical", "security / safety risk"
-        elif PROBLEM_WORDS & triple_w:
+        elif _problem_words_active(PROBLEM_WORDS & triple_w, srcl):
             sev, ptype = "High", "problem keyword"
         elif s[:40] in cycle_nodes or o[:40] in cycle_nodes:
             sev, ptype = "Medium", "circular dependency"
-        elif PROBLEM_WORDS & src_w:
+        elif _problem_words_active(PROBLEM_WORDS & src_w, srcl):
             sev, ptype = "Low", "problematic context"
         else:
             continue
@@ -2111,6 +2696,7 @@ def analyze():
     freq_cutoff     = max(1, int(request.form.get("concept_freq_cutoff", 1) or 1))
     concepts        = extract_concepts(combined, sents, ent_sents, freq_cutoff)
     entities        = build_entities(ent_counter, ent_sents, sents, concepts)
+    entities        = ai_relabel_entities(entities, combined)
     typed_entities  = extract_typed_entities(combined)
     variables       = extract_variables(combined)
     causal_regex    = extract_causal(combined)
@@ -2128,6 +2714,8 @@ def analyze():
     all_rels        = validate_findings(all_rels)
     causal          = validate_findings(causal)
     problems        = identify_problems(all_rels, entities, combined, sents, causal)
+    problems        = _dedup_problems(problems)
+    problems, structured = ai_postprocess(problems, structured, combined)
     dependencies    = build_dependencies(all_rels)
     causal_chains   = build_causal_chains(causal)
     contradictions  = detect_contradictions(all_rels, variables, sents)
@@ -2141,6 +2729,7 @@ def analyze():
 
     sid = str(uuid.uuid4())
     results = {
+        "_text": combined,                                  # retained for /ask Q&A
         "files": records, "entities": entities, "typed_entities": typed_entities,
         "concepts": concepts, "structured": structured,
         "variables": variables, "relationships": rels_display, "problems": problems,
@@ -2170,6 +2759,127 @@ def analyze():
     }
     _RESULTS[sid] = results
     return jsonify({"session_id": sid, "results": results})
+
+def ask_document(question: str, text: str, results: dict) -> str:
+    """
+    Answer a question about the document using only KeyBERT sentence embeddings
+    (all-MiniLM-L6-v2, already loaded as KW_MODEL). No API key required.
+
+    Builds a knowledge base by flattening the document sentences AND every
+    extracted analysis category (entities, concepts, problems, relationships,
+    causal chains, insights, variables, structured data) into searchable strings.
+    Embeds all chunks + the question, then returns the top matches grouped by
+    category, ranked by cosine similarity.
+    """
+    if not question.strip():
+        return "Please enter a question."
+
+    # ── Build knowledge base from document + condensed extraction ──────────
+    chunks: List[Tuple[str, str]] = []   # (category, text)
+
+    # Raw document sentences
+    for s in sent_tokenize(text):
+        s = s.strip()
+        if len(s) >= 30:
+            chunks.append(("Passage", s))
+
+    # Entities
+    for e in results.get("entities", [])[:50]:
+        t = f"{e['Entity']} ({e.get('Type','')}) — {e.get('Description','')}"
+        chunks.append(("Entity", t))
+
+    # Concepts
+    for c in results.get("concepts", [])[:40]:
+        chunks.append(("Concept", c.get("Concept", "")))
+
+    # Problems
+    for p in results.get("problems", [])[:25]:
+        t = (f"[{p.get('Severity','')}] {p.get('Subject','')} "
+             f"{p.get('Relationship','')} {p.get('Object','')}")
+        chunks.append(("Problem", t))
+
+    # Relationships
+    for r in results.get("relationships", [])[:50]:
+        t = f"{r.get('Subject','')} {r.get('Relationship','')} {r.get('Object','')}"
+        chunks.append(("Relationship", t))
+
+    # Causal chains
+    for cc in results.get("causal_chains", [])[:20]:
+        chain = " → ".join(cc.get("chain", []))
+        if chain:
+            chunks.append(("Causal Chain", chain))
+
+    # Insights
+    for ins in results.get("insights", [])[:20]:
+        t = ins.get("Insight", "")
+        if t:
+            chunks.append(("Insight", t))
+
+    # Variables
+    for v in results.get("variables", [])[:25]:
+        t = (f"{v.get('Variable / Parameter','')} = {v.get('Value','')} "
+             f"({v.get('Type','')})")
+        chunks.append(("Variable", t))
+
+    # Structured data (acronyms, dates, stats, …)
+    for s in results.get("structured", [])[:25]:
+        detail = s.get("Detail", "")
+        t = f"{s.get('Type','')} — {s.get('Value','')}" + (f" ({detail})" if detail else "")
+        chunks.append(("Structured", t))
+
+    chunks = [(lbl, txt) for lbl, txt in chunks if txt.strip()]
+    if not chunks:
+        return "No document content available to search."
+
+    # ── Embed knowledge base + question, rank by cosine similarity ─────────
+    all_texts = [txt for _, txt in chunks]
+    q_emb  = _embed([question])
+    kb_emb = _embed(all_texts)                         # (n_chunks, 384)
+    scores = cosine_similarity(q_emb, kb_emb)[0]      # (n_chunks,)
+
+    top_idx = sorted(range(len(scores)), key=lambda i: -scores[i])[:12]
+
+    # ── Deduplicate and group by category ─────────────────────────────────
+    seen: set = set()
+    grouped: Dict[str, List[str]] = {}
+    for i in top_idx:
+        lbl, txt = chunks[i]
+        key = txt.lower()[:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        grouped.setdefault(lbl, []).append(txt)
+
+    if not grouped:
+        return "No relevant content found for this question."
+
+    # ── Format answer — category sections in priority order ───────────────
+    PRIORITY = ("Insight", "Problem", "Causal Chain", "Passage",
+                "Relationship", "Entity", "Concept", "Variable", "Structured")
+    parts: List[str] = []
+    for lbl in PRIORITY:
+        if lbl not in grouped:
+            continue
+        header = f"{lbl.upper()}S" if not lbl.endswith("s") else lbl.upper()
+        bullets = "\n".join(f"  • {t}" for t in grouped[lbl])
+        parts.append(f"{header}\n{bullets}")
+
+    return "\n\n".join(parts)
+
+
+@app.route("/ask", methods=["POST"])
+def ask():
+    body = request.get_json(force=True, silent=True) or {}
+    sid  = body.get("session_id", "")
+    q    = body.get("question", "").strip()
+    if not sid or not q:
+        return jsonify({"error": "session_id and question are required"}), 400
+    data = _RESULTS.get(sid)
+    if not data:
+        return jsonify({"error": "Session not found. Please re-analyze the document."}), 404
+    answer = ask_document(q, data.get("_text", ""), data)
+    return jsonify({"answer": answer})
+
 
 @app.route("/export/<sid>/<fmt>")
 def export_results(sid: str, fmt: str):
