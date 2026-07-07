@@ -304,6 +304,32 @@ VARIABLE_PATTERNS: List[Tuple[str, str]] = [
 
 _SVO_DEPS = {"ROOT", "relcl", "xcomp", "advcl", "conj", "acl", "ccomp", "pcomp"}
 
+# Light (near-empty) verbs carry little relational information — a triple built on
+# one is less trustworthy than one built on a specific verb ("phosphorylates").
+_GENERIC_SVO_VERBS = {
+    "be", "have", "do", "make", "get", "use", "include", "involve", "show",
+    "provide", "give", "take", "become", "remain", "seem", "appear",
+}
+
+def _svo_confidence(subj: str, obj: str, verb: str, sent: str) -> int:
+    """
+    Estimate extraction confidence for a syntactic (SVO) triple from signals
+    available at parse time, instead of a flat constant. Range 40–90.
+
+    Higher when subject and object are specific multi-word noun phrases and the
+    verb is informative; lower for single-token arguments, near-empty verbs, and
+    very long sentences (where the dependency parse is more error-prone).
+    """
+    conf = 55
+    if len(subj.split()) >= 2: conf += 8      # specific subject phrase
+    if len(obj.split())  >= 2: conf += 8      # specific object phrase
+    if verb.lower() not in _GENERIC_SVO_VERBS: conf += 10   # informative verb
+    if len(subj) <= 3 or len(obj) <= 3: conf -= 8          # trivially short arg
+    n_tok = len(sent.split())
+    if n_tok > 45: conf -= 10                  # long sentence → noisier parse
+    elif n_tok <= 25: conf += 4                # short, cleanly parseable
+    return max(40, min(90, conf))
+
 _PERSON_PREFIXES = re.compile(
     r"^(O'|O’|Mc|Mac|De|Di|Van|Von|Le|La|St\.?\s)\w", re.IGNORECASE)
 
@@ -877,7 +903,8 @@ def parse_document(text: str):
                             continue
                         if st and ot and len(st) > 2:
                             svo.append({"Subject": st, "Relationship": verb, "Object": ot,
-                                        "Rel. Type": "syntactic (SVO)", "Confidence": 65,
+                                        "Rel. Type": "syntactic (SVO)",
+                                        "Confidence": _svo_confidence(st, ot, verb, sent.text),
                                         "Source Sentence": _clean(sent.text, 250), "_si": si})
 
     seen, dedup = set(), []
@@ -1209,6 +1236,8 @@ _ENTITY_OVERRIDES: Dict[str, str] = {
     "crisprrainbow":                  "TECHNOLOGY",
     "duchenne muscular dystrophy":    "DISEASE",
     "becker muscular dystrophy":      "DISEASE",
+    "addgene, inc.":                  "INSTITUTION",
+    "addgene":                        "INSTITUTION",
 }
 
 # Pre-compute label embeddings once at module load (384-dim, float32).
@@ -1889,9 +1918,12 @@ def detect_contradictions(rels: List[Dict], variables: List[Dict],
     out, seen = [], set()
 
     # 1 ── same variable assigned different values
-    # Track (value, context) so we can compare surrounding text: if the two
-    # occurrences appear in very different sentences they likely refer to different
-    # entities (e.g. "20 nt seed" vs "80 nt full guide") and the conflict is weak.
+    # A shared parameter name with two different numbers is only a real conflict
+    # when both readings describe the SAME subject. "20 nt guide-target" vs
+    # "80 nt full sgRNA", or "2,000 total genes" vs "1,500 core fitness genes",
+    # share a label but describe different things. Compare the two contexts with
+    # KeyBERT sentence embeddings: high semantic similarity ⇒ same subject ⇒ real
+    # contradiction; low similarity ⇒ different subjects ⇒ suppress entirely.
     byname: Dict[str, list] = defaultdict(list)
     for v in variables:
         key = v["Variable / Parameter"].lower()
@@ -1899,18 +1931,27 @@ def detect_contradictions(rels: List[Dict], variables: List[Dict],
         if val not in [e[0] for e in byname[key]]:
             byname[key].append((val, ctx))
     for name, entries in byname.items():
-        if len(entries) > 1:
-            val0, ctx0 = entries[0]; val1, ctx1 = entries[1]
-            words0 = set(re.findall(r"\b[a-z]{4,}\b", ctx0.lower()))
-            words1 = set(re.findall(r"\b[a-z]{4,}\b", ctx1.lower()))
-            overlap = len(words0 & words1) / max(len(words0 | words1), 1)
-            # Low overlap → the two values appear in different contexts →
-            # likely different entities, not a real contradiction.
-            severity = "Medium" if overlap >= 0.15 else "Low"
-            out.append({"Statement A": f"{name} = {val0}",
-                        "Statement B": f"{name} = {val1}",
-                        "Conflict Type": "variable value conflict",
-                        "Severity": severity})
+        if len(entries) < 2:
+            continue
+        val0, ctx0 = entries[0]; val1, ctx1 = entries[1]
+        # Semantic similarity of the two surrounding contexts (0..1).
+        sim = 0.0
+        if ctx0.strip() and ctx1.strip():
+            try:
+                emb = _embed([ctx0, ctx1])
+                sim = float(cosine_similarity(emb[0:1], emb[1:2])[0][0])
+            except Exception:
+                sim = 0.0
+        # Different subjects → not a contradiction, drop it.
+        if sim < 0.60:
+            continue
+        # Same subject, conflicting values → severity scales with how strongly the
+        # two contexts match (very similar wording ⇒ higher-confidence conflict).
+        severity = "High" if sim >= 0.80 else "Medium"
+        out.append({"Statement A": f"{name} = {val0}",
+                    "Statement B": f"{name} = {val1}",
+                    "Conflict Type": "variable value conflict",
+                    "Severity": severity})
 
     # 2 ── affirmation/negation + opposing-predicate conflicts on the same pair
     anti: Dict[str, str] = {}
