@@ -2853,13 +2853,22 @@ _COUNT_Q_RE = re.compile(
 )
 _EMAIL_Q_RE    = re.compile(r'\b(?:e-?mail|contact|address|reach)\b', re.I)
 _ACRONYM_Q_RE  = re.compile(
-    r'\b(?:stand(?:s)?\s+for|abbreviat|acronym|what\s+does\s+\w+\s+(?:mean|stand)|'
-    r'meaning\s+of|short(?:hand)?\s+for)\b', re.I)
+    r'\b(?:stand(?:s)?\s+for|abbreviat|acronym|what\s+does\s+\S+\s+(?:mean|stand)|'
+    r'meaning\s+of|short(?:hand)?\s+for|what\s+is\s+\S+\s+short\s+for)\b', re.I)
 _WHAT_IS_RE    = re.compile(
     r'\b(?:what\s+(?:is|are|was|were)|define|definition\s+of|explain|describe)\b', re.I)
+# Catches "contradict", "contradictory", "contradicts", "contradicted",
+# "conflict", "conflicting", "inconsistent", "reconcile", etc.
 _CONTRADICT_Q_RE = re.compile(
-    r'\b(?:contradict|conflict|inconsisten|reconcil|discrepan|both\s+true|'
-    r'both\s+correct|really\s+a\s+contradiction|actually\s+(?:a\s+)?contradict)\b', re.I)
+    r'\b(?:contradict\w*|conflict\w*|inconsisten\w*|reconcil\w*|discrepan\w*|'
+    r'both\s+true|both\s+correct|actually\s+(?:a\s+)?contradict\w*|'
+    r'really\s+(?:a\s+)?contradiction)\b', re.I)
+# Words in a "what is X" question that signal a comparative/analytical question,
+# not a definition lookup — entity fast-path should be bypassed for these.
+_COMPARATIVE_Q_RE = re.compile(
+    r'\b(?:advantage|benefit|differ\w*|better|worse|compar\w*|vs\.?|versus|'
+    r'over\s+(?:earlier|other|previous)|more\s+(?:precise|accurate|efficient|'
+    r'simple|flexible|powerful)|why\s+is|how\s+does)\b', re.I)
 _COUNT_STOP = frozenset({
     'how', 'many', 'times', 'often', 'frequently', 'number', 'of', 'is', 'are',
     'does', 'was', 'were', 'give', 'me', 'a', 'an', 'the', 'mentioned', 'mention',
@@ -2930,21 +2939,58 @@ def _try_acronym_answer(question: str, results: dict) -> Optional[str]:
     acronyms = [s for s in results.get("structured", []) if s.get("Type") == "Acronym"]
     if not acronyms:
         return None
-    # Try to match a specific acronym the user asked about (all-caps token in question)
-    caps = re.findall(r'\b[A-Z][A-Z0-9]{1,9}\b', question)
-    for token in caps:
+
+    # Extract the specific token the user is asking about.
+    # Handles all-caps (NHEJ, PAM), mixed-case (sgRNA, dCas9), and quoted terms.
+    # Strategy: look for the token that immediately precedes or follows the trigger phrase.
+
+    # Pattern 1: "what does X mean/stand" or "what is X short for"
+    m = re.search(
+        r'\bwhat\s+(?:does|is)\s+(["\']?)([A-Za-z][A-Za-z0-9\-]{0,15})\1\s+'
+        r'(?:mean|stand\s+for|short\s+for|an?\s+abbreviation|an?\s+acronym)',
+        question, re.I)
+    if m:
+        token = m.group(2)
         for acr in acronyms:
-            if acr.get("Value", "").upper() == token.upper():
+            if acr.get("Value", "").lower() == token.lower():
                 return f'"{acr["Value"]}" stands for: {acr["Detail"]}'
-    # Return all if no specific match
+
+    # Pattern 2: "X stands for / X abbreviation / acronym X" — token adjacent to phrase
+    m2 = re.search(
+        r'(["\']?)([A-Za-z][A-Za-z0-9\-]{0,15})\1\s+'
+        r'(?:stands?\s+for|abbreviation|acronym|mean|short\s+for)',
+        question, re.I)
+    if m2:
+        token = m2.group(2)
+        for acr in acronyms:
+            if acr.get("Value", "").lower() == token.lower():
+                return f'"{acr["Value"]}" stands for: {acr["Detail"]}'
+
+    # Pattern 3: fall back — any token in the question that exactly matches an acronym value
+    q_tokens = re.findall(r'\b[A-Za-z][A-Za-z0-9\-]{0,15}\b', question)
+    acr_map = {a["Value"].lower(): a for a in acronyms}
+    for token in q_tokens:
+        if token.lower() in acr_map:
+            acr = acr_map[token.lower()]
+            return f'"{acr["Value"]}" stands for: {acr["Detail"]}'
+
+    # No specific match — list all acronyms
     lines = [f'{a["Value"]} = {a["Detail"]}' for a in acronyms[:12]]
     return "Acronyms defined in the document:\n" + "\n".join(f"  • {l}" for l in lines)
 
 
 def _try_entity_answer(question: str, results: dict) -> Optional[str]:
-    """For 'what is X' questions look up X in entities, acronyms and concepts."""
+    """For 'what is X' / 'define X' questions look up X in entities and acronyms.
+
+    Skips entity lookup for comparative / analytical questions like
+    'what is the advantage of CRISPR over ZFNs' — those need passage retrieval.
+    """
     if not _WHAT_IS_RE.search(question):
         return None
+    # Comparative / analytical questions — don't intercept, let retrieval handle them
+    if _COMPARATIVE_Q_RE.search(question):
+        return None
+
     m = re.search(
         r'\b(?:what\s+(?:is|are|was|were)|define|definition\s+of|explain|describe)\s+'
         r'(?:the\s+|a\s+|an\s+)?(.+?)(?:\?|$)', question, re.I)
@@ -2955,14 +3001,24 @@ def _try_entity_answer(question: str, results: dict) -> Optional[str]:
         return None
     term_lower = term.lower()
 
-    # Entity table lookup (exact → partial)
-    candidates = []
+    # ── Entity table lookup ────────────────────────────────────────────────
+    # Rank matches: exact > starts-with (longer first) > contains (longer first).
+    # This ensures "Cas9" is preferred over "Cas" when the user asks "define Cas9".
+    exact, starts, contains = [], [], []
     for e in results.get("entities", []):
         ename = e.get("Entity", "").lower()
         if ename == term_lower:
-            candidates.insert(0, e)
+            exact.append(e)
+        elif ename.startswith(term_lower) or term_lower.startswith(ename):
+            starts.append(e)
         elif term_lower in ename or ename in term_lower:
-            candidates.append(e)
+            contains.append(e)
+
+    # Sort partial matches so longer (more specific) entity names come first
+    starts.sort(key=lambda e: -len(e.get("Entity", "")))
+    contains.sort(key=lambda e: -len(e.get("Entity", "")))
+
+    candidates = exact + starts + contains
     if candidates:
         best  = candidates[0]
         desc  = best.get("Description", "")
@@ -2976,7 +3032,7 @@ def _try_entity_answer(question: str, results: dict) -> Optional[str]:
             parts.append(f'Context: "{ctx}..."')
         return "\n".join(parts)
 
-    # Acronym table lookup
+    # ── Acronym table lookup ───────────────────────────────────────────────
     for s in results.get("structured", []):
         if s.get("Type") == "Acronym":
             if s.get("Value", "").lower() == term_lower:
@@ -2987,18 +3043,61 @@ def _try_entity_answer(question: str, results: dict) -> Optional[str]:
 
 def _try_contradiction_answer(question: str, results: dict) -> Optional[str]:
     """When the user asks whether two things are contradictory, look up the
-    contradiction table and return the relevant entry with context."""
+    contradiction table and return the relevant entry with context.
+
+    If the question mentions specific numbers/values that appear in the
+    variables table but were NOT flagged as contradictions (correctly
+    suppressed), explain why they are not contradictory.
+    """
     if not _CONTRADICT_Q_RE.search(question):
         return None
+
+    # ── Check whether the question references specific variable values ────
+    # Extract numbers from the question (e.g. "20", "80", "2000", "1500")
+    q_nums = re.findall(r'\b\d[\d,]*\b', question)
+    if q_nums:
+        variables = results.get("variables", [])
+        # Find variables whose value contains any of the questioned numbers
+        matched_vars = []
+        for v in variables:
+            val_str = re.sub(r'[,~\s]', '', v.get("Value", "")).lower()
+            for n in q_nums:
+                if n.replace(",", "") in val_str or val_str in n.replace(",", ""):
+                    matched_vars.append(v)
+                    break
+        # If we found matching variables but they are NOT in the contradictions list,
+        # they were intentionally suppressed — explain this to the user.
+        contradictions = results.get("contradictions", [])
+        if matched_vars and len(matched_vars) >= 2:
+            # Are any of these pairs actually in the contradiction table?
+            var_names = {v["Variable / Parameter"].lower() for v in matched_vars}
+            flagged = any(
+                any(vn in (c.get("Statement A", "") + c.get("Statement B", "")).lower()
+                    for vn in var_names)
+                for c in contradictions
+            )
+            if not flagged:
+                lines = [f'  • {v["Variable / Parameter"]} = {v["Value"]}  '
+                         f'(context: {v.get("Context","")[:120]})'
+                         for v in matched_vars[:4]]
+                return (
+                    "These values are NOT flagged as contradictions in this analysis.\n"
+                    "Both values were found in the variables table:\n"
+                    + "\n".join(lines) +
+                    "\n\nThey likely refer to different things (e.g. different components "
+                    "or subsets) rather than conflicting claims about the same quantity. "
+                    "Review the contexts above to confirm."
+                )
+
     contradictions = results.get("contradictions", [])
     if not contradictions:
         return "No contradictions were detected in these documents."
 
-    # If question mentions specific values/terms, try to match them
-    q_low = question.lower()
-    scored: List[Tuple[float, dict]] = []
+    # ── Semantic search over the contradictions table ─────────────────────
+    best, best_sim = None, 0.0
     try:
         q_emb = _embed([question])
+        scored: List[Tuple[float, dict]] = []
         for c in contradictions:
             combined = f'{c.get("Statement A","")} | {c.get("Statement B","")}'
             c_emb = _embed([combined])
@@ -3006,23 +3105,24 @@ def _try_contradiction_answer(question: str, results: dict) -> Optional[str]:
             scored.append((sim, c))
         scored.sort(key=lambda x: -x[0])
         best_sim, best = scored[0]
-        if best_sim < 0.25:
-            raise ValueError("no match")
     except Exception:
-        best = contradictions[0]
+        pass
 
-    sA = best.get("Statement A", "")
-    sB = best.get("Statement B", "")
+    # If no good match found, return a generic summary instead of the wrong entry
+    if best is None or best_sim < 0.25:
+        summary = [f'  • {c.get("Conflict Type","unknown")} — {c.get("Statement A","")[:80]}'
+                   for c in contradictions[:5]]
+        return ("No specific contradiction found for your question. "
+                f"The analysis detected {len(contradictions)} conflicting statement(s):\n"
+                + "\n".join(summary))
+
+    sA    = best.get("Statement A", "")
+    sB    = best.get("Statement B", "")
     ctype = best.get("Conflict Type", "")
     sev   = best.get("Severity", "")
-
-    # Check if conflict type is variable value — add interpretation
-    note = ""
-    if "variable" in ctype:
-        note = ("\nNote: when two values share the same variable label but come from "
-                "different sentences, this may reflect distinct sub-measurements "
-                "(e.g. a subset vs. a total) rather than a true contradiction. "
-                "Review the source passages to confirm.")
+    note  = ("\nNote: variable conflicts may reflect different sub-measurements "
+             "rather than true contradictions — review the source passages."
+             if "variable" in ctype else "")
     return (f"Potential conflict detected ({ctype}, severity: {sev}):\n"
             f"  A: {sA}\n"
             f"  B: {sB}{note}")
@@ -3140,15 +3240,22 @@ def ask_document(question: str, text: str, results: dict) -> str:
 
     parts: List[str] = []
 
-    # Show a "direct answer" block when confidence is reasonable
-    if best_score >= 0.40 and best_txt:
+    # Show a "direct answer" block when confidence is reasonable (≥55%)
+    if best_score >= 0.55 and best_txt:
         short = best_txt if len(best_txt) <= 320 else best_txt[:317] + "..."
         parts.append(f"BEST MATCH  (from {best_lbl}, relevance {best_score:.0%})\n"
                      f'"{short}"')
+    elif best_txt:
+        # Include in supporting section but note the lower confidence
+        short = best_txt if len(best_txt) <= 200 else best_txt[:197] + "..."
+        parts.append(f"CLOSEST MATCH  (low confidence {best_score:.0%} — "
+                     f"the documents may not directly address this question)\n"
+                     f'"{short}"')
 
-    # Low-confidence warning
-    if best_score < 0.30:
-        parts.append("(Low relevance — the documents may not directly address this question.)")
+    # Explicit low-confidence warning when score is very low
+    if best_score < 0.35:
+        parts.append("WARNING: Very low relevance. These documents likely do not "
+                     "contain a direct answer to this question.")
 
     # ── Supporting evidence — category sections in priority order ──────────
     PRIORITY = ("Insight", "Problem", "Causal Chain", "Passage",
