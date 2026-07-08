@@ -144,12 +144,32 @@ _MITIGATION_RE_TMPL = (
     r"avoid\w*|prevent\w*|overcom\w*|mitigat\w*|eliminat\w*|free\s+of|"
     r"no|without)\s+(?:\w+\s+){0,3}?%s\b")
 
+# Hedging phrases: the sentence describes a possibility or lists technical terms,
+# not an active problem ("can also produce", "could be used", "may occur").
+_HEDGE_RE = re.compile(
+    r'\b(?:can\s+also|could\s+also|might\s+also|may\s+also|'
+    r'can\s+potentially|could\s+potentially|might\s+potentially|'
+    r'it\s+is\s+conceivable|under\s+certain|in\s+some\s+cases)\b', re.I)
+
+
 def _problem_words_active(matched: set, srcl: str) -> set:
-    """Drop matched problem words that appear only in a mitigated context
-    ('reduced risk', 'prevent disease') so positive findings aren't flagged."""
+    """Drop matched problem words that appear only in a mitigated or hedged context.
+
+    'reduced risk' / 'prevent disease' → mitigated (existing logic).
+    'can also produce genome edits' → hedged sentence listing a mechanism, not flagging
+    an active failure. Both are suppressed so neutral facts aren't treated as problems.
+    """
     active = set()
+    hedged = bool(_HEDGE_RE.search(srcl))
     for w in matched:
         if re.search(_MITIGATION_RE_TMPL % re.escape(w), srcl):
+            continue
+        # Hedged sentences describing repair mechanisms / neutral processes are
+        # informational, not problem reports. Only suppress lower-risk words here;
+        # serious security/safety words still pass through even in hedged context.
+        if hedged and w not in {"vulnerability", "vulnerable", "breach", "unsafe",
+                                 "hazard", "unauthorized", "malware", "attack",
+                                 "compromise", "violation"}:
             continue
         active.add(w)
     return active
@@ -1945,6 +1965,15 @@ def detect_contradictions(rels: List[Dict], variables: List[Dict],
         # Different subjects → not a contradiction, drop it.
         if sim < 0.60:
             continue
+        # Near-identical contexts (sim > 0.95) mean both values come from the
+        # same sentence. Check for subset language ("including", "of which",
+        # "conserved across", "of these") that proves one value is a subset of
+        # the other — that is NOT a contradiction and should be suppressed.
+        _SUBSET_RE = re.compile(
+            r'\bincluding|of\s+which|of\s+these|among\s+(?:them|which)|'
+            r'conserved\s+across|of\s+the\s+\d|within\s+(?:the|those)\b', re.I)
+        if sim > 0.95 and (_SUBSET_RE.search(ctx0) or _SUBSET_RE.search(ctx1)):
+            continue
         # Same subject, conflicting values → severity scales with how strongly the
         # two contexts match (very similar wording ⇒ higher-confidence conflict).
         severity = "High" if sim >= 0.80 else "Medium"
@@ -2816,11 +2845,21 @@ def analyze():
     _RESULTS[sid] = results
     return jsonify({"session_id": sid, "results": results})
 
+# ── Q&A fast-path regex constants ─────────────────────────────────────────────
 _COUNT_Q_RE = re.compile(
     r'\b(?:how\s+many\s+times|number\s+of\s+times|how\s+often|how\s+frequently|'
     r'times\s+(?:is|are|does|was|were))\b',
     re.I,
 )
+_EMAIL_Q_RE    = re.compile(r'\b(?:e-?mail|contact|address|reach)\b', re.I)
+_ACRONYM_Q_RE  = re.compile(
+    r'\b(?:stand(?:s)?\s+for|abbreviat|acronym|what\s+does\s+\w+\s+(?:mean|stand)|'
+    r'meaning\s+of|short(?:hand)?\s+for)\b', re.I)
+_WHAT_IS_RE    = re.compile(
+    r'\b(?:what\s+(?:is|are|was|were)|define|definition\s+of|explain|describe)\b', re.I)
+_CONTRADICT_Q_RE = re.compile(
+    r'\b(?:contradict|conflict|inconsisten|reconcil|discrepan|both\s+true|'
+    r'both\s+correct|really\s+a\s+contradiction|actually\s+(?:a\s+)?contradict)\b', re.I)
 _COUNT_STOP = frozenset({
     'how', 'many', 'times', 'often', 'frequently', 'number', 'of', 'is', 'are',
     'does', 'was', 'were', 'give', 'me', 'a', 'an', 'the', 'mentioned', 'mention',
@@ -2865,6 +2904,130 @@ def _try_count_answer(question: str, text: str) -> Optional[str]:
     return f'"{best_term}" appears {best_count} time{s} in the document.'
 
 
+def _try_count_answer_wrap(question: str, text: str) -> Optional[str]:
+    return _try_count_answer(question, text)
+
+
+def _try_email_answer(question: str, results: dict) -> Optional[str]:
+    """Return contact emails directly from structured data when the question asks for one."""
+    if not _EMAIL_Q_RE.search(question):
+        return None
+    emails = [s for s in results.get("structured", []) if s.get("Type") == "Email"]
+    if not emails:
+        return None
+    lines = []
+    for e in emails:
+        val  = e.get("Value", "")
+        ctx  = e.get("Context", "")[:120].strip()
+        lines.append(f"{val}  (context: {ctx})")
+    return "Email contacts found in the document:\n" + "\n".join(f"  • {l}" for l in lines)
+
+
+def _try_acronym_answer(question: str, results: dict) -> Optional[str]:
+    """Return acronym definitions directly from structured data."""
+    if not _ACRONYM_Q_RE.search(question):
+        return None
+    acronyms = [s for s in results.get("structured", []) if s.get("Type") == "Acronym"]
+    if not acronyms:
+        return None
+    # Try to match a specific acronym the user asked about (all-caps token in question)
+    caps = re.findall(r'\b[A-Z][A-Z0-9]{1,9}\b', question)
+    for token in caps:
+        for acr in acronyms:
+            if acr.get("Value", "").upper() == token.upper():
+                return f'"{acr["Value"]}" stands for: {acr["Detail"]}'
+    # Return all if no specific match
+    lines = [f'{a["Value"]} = {a["Detail"]}' for a in acronyms[:12]]
+    return "Acronyms defined in the document:\n" + "\n".join(f"  • {l}" for l in lines)
+
+
+def _try_entity_answer(question: str, results: dict) -> Optional[str]:
+    """For 'what is X' questions look up X in entities, acronyms and concepts."""
+    if not _WHAT_IS_RE.search(question):
+        return None
+    m = re.search(
+        r'\b(?:what\s+(?:is|are|was|were)|define|definition\s+of|explain|describe)\s+'
+        r'(?:the\s+|a\s+|an\s+)?(.+?)(?:\?|$)', question, re.I)
+    if not m:
+        return None
+    term = re.sub(r'\b(?:the|a|an|this|these|those)\b', '', m.group(1), flags=re.I).strip()
+    if len(term) < 2:
+        return None
+    term_lower = term.lower()
+
+    # Entity table lookup (exact → partial)
+    candidates = []
+    for e in results.get("entities", []):
+        ename = e.get("Entity", "").lower()
+        if ename == term_lower:
+            candidates.insert(0, e)
+        elif term_lower in ename or ename in term_lower:
+            candidates.append(e)
+    if candidates:
+        best  = candidates[0]
+        desc  = best.get("Description", "")
+        etype = best.get("Type", "")
+        occ   = best.get("Occurrences", 0)
+        ctx   = best.get("Context", "")[:200]
+        parts = [f'{best["Entity"]} ({etype}): {desc}']
+        if occ:
+            parts.append(f'Mentioned {occ} time(s) in the documents.')
+        if ctx:
+            parts.append(f'Context: "{ctx}..."')
+        return "\n".join(parts)
+
+    # Acronym table lookup
+    for s in results.get("structured", []):
+        if s.get("Type") == "Acronym":
+            if s.get("Value", "").lower() == term_lower:
+                return f'{s["Value"]} stands for: {s["Detail"]}'
+
+    return None
+
+
+def _try_contradiction_answer(question: str, results: dict) -> Optional[str]:
+    """When the user asks whether two things are contradictory, look up the
+    contradiction table and return the relevant entry with context."""
+    if not _CONTRADICT_Q_RE.search(question):
+        return None
+    contradictions = results.get("contradictions", [])
+    if not contradictions:
+        return "No contradictions were detected in these documents."
+
+    # If question mentions specific values/terms, try to match them
+    q_low = question.lower()
+    scored: List[Tuple[float, dict]] = []
+    try:
+        q_emb = _embed([question])
+        for c in contradictions:
+            combined = f'{c.get("Statement A","")} | {c.get("Statement B","")}'
+            c_emb = _embed([combined])
+            sim   = float(cosine_similarity(q_emb, c_emb)[0][0])
+            scored.append((sim, c))
+        scored.sort(key=lambda x: -x[0])
+        best_sim, best = scored[0]
+        if best_sim < 0.25:
+            raise ValueError("no match")
+    except Exception:
+        best = contradictions[0]
+
+    sA = best.get("Statement A", "")
+    sB = best.get("Statement B", "")
+    ctype = best.get("Conflict Type", "")
+    sev   = best.get("Severity", "")
+
+    # Check if conflict type is variable value — add interpretation
+    note = ""
+    if "variable" in ctype:
+        note = ("\nNote: when two values share the same variable label but come from "
+                "different sentences, this may reflect distinct sub-measurements "
+                "(e.g. a subset vs. a total) rather than a true contradiction. "
+                "Review the source passages to confirm.")
+    return (f"Potential conflict detected ({ctype}, severity: {sev}):\n"
+            f"  A: {sA}\n"
+            f"  B: {sB}{note}")
+
+
 def ask_document(question: str, text: str, results: dict) -> str:
     """
     Answer a question about the document using only KeyBERT sentence embeddings
@@ -2879,10 +3042,15 @@ def ask_document(question: str, text: str, results: dict) -> str:
     if not question.strip():
         return "Please enter a question."
 
-    # Fast path: count/frequency questions get a direct answer
-    count_ans = _try_count_answer(question, text)
-    if count_ans:
-        return count_ans
+    # ── Structured fast paths (no embedding needed) ────────────────────────
+    for _handler in (_try_count_answer_wrap, _try_email_answer,
+                     _try_acronym_answer, _try_entity_answer,
+                     _try_contradiction_answer):
+        _ans = (_handler(question, text)
+                if _handler is _try_count_answer_wrap
+                else _handler(question, results))
+        if _ans:
+            return _ans
 
     # ── Build knowledge base from document + condensed extraction ──────────
     chunks: List[Tuple[str, str]] = []   # (category, text)
@@ -2947,32 +3115,59 @@ def ask_document(question: str, text: str, results: dict) -> str:
     kb_emb = _embed(all_texts)                         # (n_chunks, 384)
     scores = cosine_similarity(q_emb, kb_emb)[0]      # (n_chunks,)
 
-    top_idx = sorted(range(len(scores)), key=lambda i: -scores[i])[:12]
+    top_idx = sorted(range(len(scores)), key=lambda i: -scores[i])[:14]
 
     # ── Deduplicate and group by category ─────────────────────────────────
     seen: set = set()
-    grouped: Dict[str, List[str]] = {}
+    grouped: Dict[str, List[Tuple[float, str]]] = {}   # lbl → [(score, text)]
     for i in top_idx:
         lbl, txt = chunks[i]
         key = txt.lower()[:120]
         if key in seen:
             continue
         seen.add(key)
-        grouped.setdefault(lbl, []).append(txt)
+        grouped.setdefault(lbl, []).append((float(scores[i]), txt))
 
     if not grouped:
         return "No relevant content found for this question."
 
-    # ── Format answer — category sections in priority order ───────────────
+    # ── Pick the single best-scoring item as the direct answer ────────────
+    best_score, best_lbl, best_txt = 0.0, "", ""
+    for lbl, items in grouped.items():
+        sc, tx = items[0]
+        if sc > best_score:
+            best_score, best_lbl, best_txt = sc, lbl, tx
+
+    parts: List[str] = []
+
+    # Show a "direct answer" block when confidence is reasonable
+    if best_score >= 0.40 and best_txt:
+        short = best_txt if len(best_txt) <= 320 else best_txt[:317] + "..."
+        parts.append(f"BEST MATCH  (from {best_lbl}, relevance {best_score:.0%})\n"
+                     f'"{short}"')
+
+    # Low-confidence warning
+    if best_score < 0.30:
+        parts.append("(Low relevance — the documents may not directly address this question.)")
+
+    # ── Supporting evidence — category sections in priority order ──────────
     PRIORITY = ("Insight", "Problem", "Causal Chain", "Passage",
                 "Relationship", "Entity", "Concept", "Variable", "Structured")
-    parts: List[str] = []
+    support: List[str] = []
     for lbl in PRIORITY:
         if lbl not in grouped:
             continue
+        items = grouped[lbl]
+        # Exclude the item already shown as best match
+        rest = [tx for sc, tx in items if tx != best_txt][:3]
+        if not rest:
+            continue
         header = f"{lbl.upper()}S" if not lbl.endswith("s") else lbl.upper()
-        bullets = "\n".join(f"  • {t}" for t in grouped[lbl])
-        parts.append(f"{header}\n{bullets}")
+        bullets = "\n".join(f"  • {t}" for t in rest)
+        support.append(f"{header}\n{bullets}")
+
+    if support:
+        parts.append("SUPPORTING EVIDENCE\n" + "\n\n".join(support))
 
     return "\n\n".join(parts)
 
