@@ -2631,6 +2631,9 @@ def _export_excel_bytes(results: Dict) -> bytes:
     ws("Executive Insights",     results["insights"])
     ws("Graph Nodes",            results["graph"]["nodes"])
     ws("Graph Edges",            results["graph"]["edges"])
+    qa = results.get("_qa", [])
+    if qa:
+        ws("Q&A History", qa)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -2647,6 +2650,9 @@ def _export_csv_bytes(results: Dict) -> bytes:
               "assumptions": results["assumptions"], "insights": results["insights"],
               "graph_nodes": results["graph"]["nodes"],
               "graph_edges": results["graph"]["edges"]}
+    qa = results.get("_qa")
+    if qa:
+        sheets["qa_history"] = qa
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in sheets.items():
             csv_str = pd.DataFrame(data if data else [{name: "No data"}]).to_csv(index=False, encoding="utf-8-sig")
@@ -2684,6 +2690,15 @@ def _export_markdown_bytes(results: Dict) -> bytes:
     out += section("Assumptions",            results["assumptions"])
     out += section("Knowledge Graph – Nodes", results["graph"]["nodes"])
     out += section("Knowledge Graph – Edges", results["graph"]["edges"])
+    qa = results.get("_qa", [])
+    if qa:
+        out += ["## Q&A History", ""]
+        for i, entry in enumerate(qa, 1):
+            out.append(f"**Q{i}:** {entry.get('Question', '')}")
+            out.append("")
+            for line in entry.get("Answer", "").splitlines():
+                out.append(line)
+            out += ["", "---", ""]
     return "\n".join(out).encode("utf-8")
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
@@ -2801,6 +2816,55 @@ def analyze():
     _RESULTS[sid] = results
     return jsonify({"session_id": sid, "results": results})
 
+_COUNT_Q_RE = re.compile(
+    r'\b(?:how\s+many\s+times|number\s+of\s+times|how\s+often|how\s+frequently|'
+    r'times\s+(?:is|are|does|was|were))\b',
+    re.I,
+)
+_COUNT_STOP = frozenset({
+    'how', 'many', 'times', 'often', 'frequently', 'number', 'of', 'is', 'are',
+    'does', 'was', 'were', 'give', 'me', 'a', 'an', 'the', 'mentioned', 'mention',
+    'appear', 'appears', 'appearing', 'occurring', 'occurs', 'occur', 'said',
+    'used', 'found', 'in', 'this', 'document', 'text', 'here', 'count', 'frequency',
+    'tell', 'what', 'do', 'please', 'and', 'or', 'it', 'its', 'that', 'which',
+    'to', 'per', 'across', 'throughout', 'within', 'cited',
+})
+
+
+def _try_count_answer(question: str, text: str) -> Optional[str]:
+    """Return a direct count answer if the question asks how many times something appears."""
+    if not _COUNT_Q_RE.search(question):
+        return None
+
+    tokens = re.findall(r'\b[\w\-]+\b', question)
+    terms = [t for t in tokens if t.lower() not in _COUNT_STOP and len(t) > 1]
+    if not terms:
+        return None
+
+    candidates: List[Tuple[int, str]] = []
+    # Try adjacent pairs first
+    for i in range(len(terms) - 1):
+        phrase = f"{terms[i]} {terms[i + 1]}"
+        cnt = len(re.findall(r'\b' + re.escape(phrase) + r'\b', text, re.I))
+        if cnt > 0:
+            candidates.append((cnt, phrase))
+    # Try individual terms
+    for t in terms:
+        cnt = len(re.findall(r'\b' + re.escape(t) + r'\b', text, re.I))
+        if cnt > 0:
+            candidates.append((cnt, t))
+
+    if not candidates:
+        best_term = max(terms, key=len)
+        return f'"{best_term}" does not appear to be mentioned in the document.'
+
+    # Prefer longer matches; break ties by highest count
+    candidates.sort(key=lambda x: (-len(x[1]), -x[0]))
+    best_count, best_term = candidates[0]
+    s = "" if best_count == 1 else "s"
+    return f'"{best_term}" appears {best_count} time{s} in the document.'
+
+
 def ask_document(question: str, text: str, results: dict) -> str:
     """
     Answer a question about the document using only KeyBERT sentence embeddings
@@ -2814,6 +2878,11 @@ def ask_document(question: str, text: str, results: dict) -> str:
     """
     if not question.strip():
         return "Please enter a question."
+
+    # Fast path: count/frequency questions get a direct answer
+    count_ans = _try_count_answer(question, text)
+    if count_ans:
+        return count_ans
 
     # ── Build knowledge base from document + condensed extraction ──────────
     chunks: List[Tuple[str, str]] = []   # (category, text)
@@ -2919,6 +2988,8 @@ def ask():
     if not data:
         return jsonify({"error": "Session not found. Please re-analyze the document."}), 404
     answer = ask_document(q, data.get("_text", ""), data)
+    # Persist exchange so it appears in exported files
+    data.setdefault("_qa", []).append({"Question": q, "Answer": answer})
     return jsonify({"answer": answer})
 
 
