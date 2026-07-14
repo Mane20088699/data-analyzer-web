@@ -118,6 +118,26 @@ try:
 except Exception as _gl_exc:
     GLINER = None
     print(f"  [!] GLiNER unavailable ({_gl_exc}) — skipping typed-entity extraction")
+
+# ── Cross-encoder reranker (sentence-transformers, already installed) ──────────
+try:
+    from sentence_transformers import CrossEncoder as _CrossEncoder
+    CROSS_ENC = _CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
+    print("  [OK] CrossEncoder: ms-marco-MiniLM-L-6-v2")
+except Exception as _ce_exc:
+    CROSS_ENC = None
+    print(f"  [!] CrossEncoder unavailable ({_ce_exc}) — reranking disabled")
+
+# ── BM25 lexical search ────────────────────────────────────────────────────────
+try:
+    from rank_bm25 import BM25Okapi as _BM25Okapi
+    _BM25_AVAILABLE = True
+    print("  [OK] BM25: rank-bm25")
+except ImportError:
+    _BM25Okapi = None
+    _BM25_AVAILABLE = False
+    print("  [!] rank-bm25 not installed — lexical search disabled")
+
 print("Ready.\n")
 
 # ── Patterns ──────────────────────────────────────────────────────────────────
@@ -1665,7 +1685,7 @@ def extract_variables(text: str) -> List[Dict]:
                     if key not in seen:
                         seen.add(key)
                         results.append({"Variable / Parameter": name, "Value": val,
-                                        "Type": vtype, "Context": _clean(sent)})
+                                        "Type": vtype, "Context": _clean(sent, 400)})
                 except Exception: continue
 
     # Scientific density/biomass values (e.g., "18,486 salamanders/ha", "1,770 g/ha")
@@ -1680,7 +1700,7 @@ def extract_variables(text: str) -> List[Dict]:
                     seen.add(key)
                     results.append({"Variable / Parameter": param,
                                     "Value": val, "Type": "measurement",
-                                    "Context": _clean(sent)})
+                                    "Context": _clean(sent, 400)})
 
     # Molecular-biology inline quantities: "~2,000 genes", "20-nt spacer",
     # "90% inheritance", "3 base pairs upstream". These don't fit the
@@ -1696,7 +1716,7 @@ def extract_variables(text: str) -> List[Dict]:
                     results.append({"Variable / Parameter": param,
                                     "Value": val + (" " + unit if unit else ""),
                                     "Type": "molecular quantity",
-                                    "Context": _clean(sent)})
+                                    "Context": _clean(sent, 400)})
     return results
 
 # ── Causal / relational regex extraction (with confidence) ──────────────────────
@@ -2852,6 +2872,40 @@ _COUNT_Q_RE = re.compile(
     re.I,
 )
 _EMAIL_Q_RE    = re.compile(r'\b(?:e-?mail|contact|address|reach)\b', re.I)
+_URL_Q_RE      = re.compile(r'\b(?:url|website|web\s*site|link|http|www)\b', re.I)
+_IS_PROBLEM_Q_RE = re.compile(
+    r'\b(?:is|are)\b.{0,120}\b(?:a\s+)?(?:problem|concern|issue|risk|'
+    r'dangerous|harmful|high.?severity)\b', re.I)
+_PARAGRAPH_Q_RE = re.compile(
+    r'\b(?:full\s+(?:source\s+)?(?:paragraph|sentence|passage|quote|text)|'
+    r'exact\s+(?:paragraph|sentence|passage|quote|text|wording)|'
+    r'source\s+(?:paragraph|sentence|passage|text)|'
+    r'original\s+(?:paragraph|sentence|passage|text|wording)|'
+    r'actual\s+(?:paragraph|sentence|passage|text)|'
+    r'verbatim|word[\s-]for[\s-]word|'
+    r'give\s+(?:me\s+)?the\s+(?:full|exact|complete|original))\b', re.I)
+# Words to drop when reducing a paragraph request to its search topic, e.g.
+# "give the full source paragraph that mentions the gene counts" -> "gene counts".
+# Combined with nltk STOPWORDS at call time so connective words (that/which/where…)
+# are removed too.
+_PARAGRAPH_STOP = frozenset({
+    'full', 'exact', 'complete', 'source', 'original', 'raw', 'actual', 'verbatim',
+    'paragraph', 'paragraphs', 'passage', 'passages', 'sentence', 'sentences',
+    'quote', 'quotes', 'text', 'wording', 'word', 'words', 'line', 'lines',
+    'give', 'show', 'provide', 'return', 'find', 'please', 'get', 'tell',
+    'mention', 'mentions', 'mentioned', 'mentioning', 'describe', 'describes',
+    'describing', 'discuss', 'discusses', 'discussing', 'say', 'says', 'talk',
+    'talks', 'state', 'states', 'stating', 'regarding', 'concerning', 'relating',
+    'relates', 'related', 'main', 'primary', 'key', 'whole', 'entire', 'exact',
+    'document', 'paper', 'article', 'section',
+})
+_SUMMARIZE_Q_RE = re.compile(
+    r'\b(?:summarize|summarise|summary|overview|tldr|tl.?dr|'
+    r'what\s+is\s+this\s+(?:document|paper|article|text)\s+about|'
+    r'give\s+(?:me\s+)?(?:a\s+)?(?:brief|quick|short|overall)\s+'
+    r'(?:summary|overview|description)|'
+    r'what\s+(?:does\s+this|is\s+the\s+main)\s+(?:document|paper|article)\s+'
+    r'(?:say|cover|discuss|about))\b', re.I)
 _ACRONYM_Q_RE  = re.compile(
     r'\b(?:stand(?:s)?\s+for|abbreviat|acronym|what\s+does\s+\S+\s+(?:mean|stand)|'
     r'meaning\s+of|short(?:hand)?\s+for|what\s+is\s+\S+\s+short\s+for)\b', re.I)
@@ -2868,7 +2922,9 @@ _CONTRADICT_Q_RE = re.compile(
 _COMPARATIVE_Q_RE = re.compile(
     r'\b(?:advantage|benefit|differ\w*|better|worse|compar\w*|vs\.?|versus|'
     r'over\s+(?:earlier|other|previous)|more\s+(?:precise|accurate|efficient|'
-    r'simple|flexible|powerful)|why\s+is|how\s+does)\b', re.I)
+    r'simple|flexible|powerful)|why\s+is|how\s+does|'
+    r'stage\w*|step\w*|phase\w*|mechanism\w*|process\w*|pathway\w*|'
+    r'three|four|five|multiple|several)\b', re.I)
 _COUNT_STOP = frozenset({
     'how', 'many', 'times', 'often', 'frequently', 'number', 'of', 'is', 'are',
     'does', 'was', 'were', 'give', 'me', 'a', 'an', 'the', 'mentioned', 'mention',
@@ -2876,6 +2932,19 @@ _COUNT_STOP = frozenset({
     'used', 'found', 'in', 'this', 'document', 'text', 'here', 'count', 'frequency',
     'tell', 'what', 'do', 'please', 'and', 'or', 'it', 'its', 'that', 'which',
     'to', 'per', 'across', 'throughout', 'within', 'cited',
+})
+# For _try_variable_answer: factual count / measurement lookups
+_FACTUAL_HOW_MANY_RE = re.compile(r'\bhow\s+many\b', re.I)
+_LENGTH_Q_RE = re.compile(r'\b(?:length|long|size)\b', re.I)  # "what is the length of"
+_VAR_LOOKUP_STOP = frozenset({
+    'how', 'many', 'what', 'is', 'are', 'was', 'were', 'the', 'a', 'an',
+    'number', 'count', 'total', 'of', 'in', 'this', 'document', 'text',
+    'identified', 'found', 'detected', 'reported', 'mentioned', 'there',
+    'have', 'been', 'study', 'studies', 'research', 'per', 'about', 'that',
+    # additional function words that don't help disambiguate variables
+    'does', 'did', 'can', 'could', 'would', 'should', 'will', 'shall',
+    'which', 'who', 'when', 'where', 'into', 'onto', 'with', 'for', 'not',
+    'all', 'any', 'each', 'but', 'use', 'using', 'used', 'make', 'made',
 })
 
 
@@ -2917,6 +2986,377 @@ def _try_count_answer_wrap(question: str, text: str) -> Optional[str]:
     return _try_count_answer(question, text)
 
 
+def _split_paragraphs(text: str) -> List[str]:
+    """Split raw document text into whole paragraphs (blank-line separated).
+
+    Falls back to grouping consecutive sentences when the source has no blank-line
+    structure (common in single-column PDF extractions). Internal whitespace is
+    collapsed so each paragraph reads as one clean block, but the wording is kept
+    verbatim."""
+    raw = re.split(r'\n[ \t]*\n+', text)
+    paras = [re.sub(r'\s+', ' ', p).strip() for p in raw]
+    paras = [p for p in paras if len(p) >= 40]
+    # If blank lines gave us almost nothing (one giant block), rebuild paragraphs
+    # by grouping sentences into ~4-sentence windows.
+    if len(paras) < 3:
+        sents = [s.strip() for s in sent_tokenize(text) if s.strip()]
+        paras, cur = [], []
+        for s in sents:
+            cur.append(s)
+            if len(cur) >= 4:
+                paras.append(re.sub(r'\s+', ' ', ' '.join(cur)).strip())
+                cur = []
+        if cur:
+            paras.append(re.sub(r'\s+', ' ', ' '.join(cur)).strip())
+        paras = [p for p in paras if len(p) >= 40]
+    return paras
+
+
+def _singularise(tok: str) -> str:
+    """Crude singulariser so lexical matching treats gene~genes, stage~stages,
+    count~counts as the same term (no stemming library needed)."""
+    if len(tok) > 4 and tok.endswith('ies'):
+        return tok[:-3] + 'y'
+    if len(tok) > 4 and tok.endswith('s') and not tok.endswith('ss'):
+        return tok[:-1]
+    return tok
+
+
+def _expand_paragraph(paras: List[str], idx: int) -> str:
+    """Grow a colon-terminated heading / short lead-in into the list or sentences
+    that complete it, so 'The bacterial CRISPR immune system works in three stages:'
+    is returned together with the numbered stages that follow it."""
+    parts = [paras[idx]]
+    j = idx + 1
+    while j < len(paras) and j <= idx + 3:
+        prev = parts[-1].rstrip()
+        nxt  = paras[j].strip()
+        is_list = bool(re.match(r'^(?:\d+[.)]|[-*•])', nxt))
+        if prev.endswith(':') or is_list or (len(parts[-1]) < 160 and is_list):
+            parts.append(nxt)
+            j += 1
+        else:
+            break
+    return '\n'.join(parts)
+
+
+def _try_paragraph_answer(question: str, text: str) -> Optional[str]:
+    """For 'full source paragraph / exact passage / verbatim' requests, return the
+    WHOLE raw paragraph(s) that best match the question's topic — ranked by a hybrid
+    of lexical BM25 (favoured, so paragraphs that literally contain the key term win)
+    and semantic similarity, then cross-encoder reranked. Colon-headed lead-ins are
+    expanded to include the list that follows. Verbatim; never a single sentence or a
+    Variable/relationship chunk."""
+    if not _PARAGRAPH_Q_RE.search(question):
+        return None
+    # Reduce the question to its topic (drop request boilerplate + stopwords):
+    # "give the full source paragraph that mentions the gene counts" -> "gene counts".
+    topic_tokens = [w for w in re.findall(r"[a-z0-9']+", question.lower())
+                    if w not in _PARAGRAPH_STOP and w not in STOPWORDS]
+    topic = ' '.join(topic_tokens) if topic_tokens else question
+
+    paras = _split_paragraphs(text)
+    if not paras:
+        return None
+    n = len(paras)
+
+    # Semantic similarity (all-MiniLM-L6-v2).
+    q_emb    = _embed([topic])
+    p_emb    = _embed(paras)
+    sem      = cosine_similarity(q_emb, p_emb)[0]
+    sem_norm = sem / sem.max() if sem.max() > 0 else sem
+
+    # Lexical BM25 with light singularisation so gene~genes / stage~stages match —
+    # this is what pins the answer to the paragraph that actually contains the term.
+    q_lex = [_singularise(w) for w in (topic_tokens or
+             re.findall(r"[a-z0-9']+", topic.lower()))]
+    if _BM25_AVAILABLE and q_lex:
+        docs    = [[_singularise(w) for w in re.findall(r"[a-z0-9']+", p.lower())]
+                   for p in paras]
+        bm      = np.array(_BM25Okapi(docs).get_scores(q_lex), dtype=float)
+        bm_norm = bm / bm.max() if bm.max() > 0 else bm
+    else:
+        bm_norm = np.zeros(n)
+
+    # Favour lexical (exact-phrase intent) with semantic as tie-breaker.
+    combined = 0.6 * bm_norm + 0.4 * sem_norm
+    order    = sorted(range(n), key=lambda i: -combined[i])
+
+    # Cross-encoder rerank over the top hybrid candidates for precision.
+    top = order[:8]
+    if CROSS_ENC is not None and len(top) > 1:
+        ce  = CROSS_ENC.predict([(topic, paras[i]) for i in top],
+                                show_progress_bar=False)
+        top = [i for i, _ in sorted(zip(top, ce), key=lambda x: -x[1])]
+    if not top:
+        return None
+
+    best_i = top[0]
+    # How many distinct topic terms actually appear in the chosen paragraph —
+    # drives the best-effort disclaimer when we could not find a real match.
+    best_doc = {_singularise(w) for w in re.findall(r"[a-z0-9']+", paras[best_i].lower())}
+    q_set    = set(q_lex)
+    coverage = (sum(1 for w in q_set if w in best_doc) / len(q_set)) if q_set else 1.0
+
+    header = ("Source paragraph — verbatim from the document:"
+              if coverage >= 0.5 else
+              "Closest match (an exact paragraph for this topic was not found; "
+              "best effort) — verbatim from the document:")
+    primary = _expand_paragraph(paras, best_i)
+    out = [header + "\n", f'"{primary}"']
+
+    # One alternate whole paragraph, if a distinct one ranks next.
+    for i in top[1:4]:
+        alt = _expand_paragraph(paras, i)
+        if alt.strip() and alt[:60] != primary[:60]:
+            out.append("\nOther paragraph that may be relevant:")
+            out.append(f'\n"{alt}"')
+            break
+    return "\n".join(out)
+
+
+def _try_summarize_answer(question: str, text: str, results: dict) -> Optional[str]:
+    """Return a structured extractive summary of the document."""
+    if not _SUMMARIZE_Q_RE.search(question):
+        return None
+    s = results.get("summary", {})
+    parts: List[str] = [
+        f'Document: {s.get("Total Words","?")} words across '
+        f'{s.get("Files Analyzed","?")} file(s).',
+    ]
+    ents = results.get("entities", [])
+    if ents:
+        e = ents[0]
+        parts.append(f'Primary Entity: {e["Entity"]} ({e.get("Type","")}) — '
+                     f'{e.get("Description","")}')
+    concepts = [c.get("Concept", "") for c in results.get("concepts", [])[:5]
+                if c.get("Concept")]
+    if concepts:
+        parts.append("Key Concepts: " + ", ".join(concepts))
+    variables = results.get("variables", [])[:4]
+    if variables:
+        parts.append("Key Quantities: " + "; ".join(
+            f'{v.get("Variable / Parameter","")} = {v.get("Value","")}'
+            for v in variables))
+    high_p = [p for p in results.get("problems", [])
+              if p.get("Severity") in ("High", "Critical")]
+    if high_p:
+        parts.append("High-Priority Issues: " + "; ".join(
+            p.get("Subject", "")[:60] for p in high_p[:3]))
+    sents = [sn for sn in sent_tokenize(text) if len(sn.split()) >= 8]
+    if len(sents) >= 3:
+        try:
+            embs = _embed(sents)
+            centroid = embs.mean(axis=0, keepdims=True)
+            sim = cosine_similarity(centroid, embs)[0]
+            top_idx = sorted(sorted(range(len(sim)), key=lambda i: -sim[i])[:4])
+            parts.append("\nKey Passages:")
+            for i in top_idx:
+                sn = sents[i].strip()
+                parts.append("  • " + (sn if len(sn) <= 200 else sn[:197] + "..."))
+        except Exception:
+            pass
+    return "\n".join(parts)
+
+
+def _value_centered_excerpt(v: dict, chars_after: int = 120) -> str:
+    """Return a context excerpt centered on where the variable's numeric value appears.
+
+    Both variables in a tie often share the same context sentence. This gives each
+    a *different* excerpt so the reader can see which quantity refers to which concept.
+    """
+    ctx = v.get("Context", "")
+    val = v.get("Value", "")
+    m = re.search(r'\d+', re.sub(r'[,~≈<>]', '', val))
+    if not m:
+        return ctx[:200]
+    num = m.group()
+    ctx_clean = re.sub(r'[,~≈<>]', '', ctx)
+    m2 = re.search(r'\b' + re.escape(num) + r'\b', ctx_clean)
+    if not m2:
+        return ctx[:200]
+    pos = m2.start()
+    start = max(0, pos - 40)
+    end = min(len(ctx_clean), pos + chars_after)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(ctx_clean) else ""
+    return prefix + ctx_clean[start:end] + suffix
+
+
+def _proximity_score(v: dict, terms: list, word_window: int = 3) -> int:
+    """Count question terms within *word_window* words after the variable's value.
+
+    Used as a tiebreaker when two variables earn the same base score.  A small
+    window (3 words) avoids over-counting shared context between values that appear
+    in the same long sentence.
+    """
+    ctx_clean = re.sub(r'[,~≈<>]', '', v.get("Context", "").lower())
+    val_clean = re.sub(r'[,~≈<>]', '', v.get("Value", "").lower())
+    m = re.search(r'\d+', val_clean)
+    if not m:
+        return 0
+    num = m.group()
+    m2 = re.search(r'\b' + re.escape(num) + r'\b', ctx_clean)
+    if not m2:
+        return 0
+    words_after = ctx_clean[m2.start():].split()[:word_window + 2]
+    window_text = ' '.join(words_after)
+    return sum(
+        1 for t in terms
+        if re.search(r'\b' + re.escape(t) + r's?\b', window_text)
+    )
+
+
+def _try_variable_answer(question: str, results: dict) -> Optional[str]:
+    """For 'how many X' and 'what is the length of X' questions, look up measured values.
+
+    Handles questions like 'How many core fitness genes were identified?' and
+    'What is the length of the seed sequence?' where the answer is a named measurement
+    already extracted into the variables table, not a raw mention count.
+    Requires ≥ 2 matching terms to avoid false positives.
+    """
+    triggers_how_many = _FACTUAL_HOW_MANY_RE.search(question)
+    triggers_length   = _LENGTH_Q_RE.search(question)
+    if not triggers_how_many and not triggers_length:
+        return None
+    # 'how many times X is mentioned' → handled by _try_count_answer, don't overlap
+    if _COUNT_Q_RE.search(question):
+        return None
+    # Contradiction / comparison questions need passage retrieval, not a single value
+    if _CONTRADICT_Q_RE.search(question):
+        return None
+    variables = results.get("variables", [])
+    if not variables:
+        return None
+    words = re.findall(r'\b[a-z]\w+\b', question.lower())
+    terms = [w for w in words if w not in _VAR_LOOKUP_STOP and len(w) > 2]
+    if not terms:
+        return None
+
+    # Unit-type hints help when the exact word appears only as an abbreviation (nt / bp)
+    q_lower = question.lower()
+    wants_nt = bool(re.search(r'\bnucleotide', q_lower))
+    wants_bp = bool(re.search(r'\bbase.?pair', q_lower))
+
+    scored: List[Tuple[int, dict]] = []
+    for v in variables:
+        vname = v.get("Variable / Parameter", "").lower()
+        vctx  = v.get("Context", "").lower()
+        # Plural-aware whole-word matching: "sgrna" matches "sgrnas", "gene" matches "genes"
+        hits = sum(
+            1 for t in terms
+            if re.search(r'\b' + re.escape(t) + r's?\b', vname)
+            or re.search(r'\b' + re.escape(t) + r's?\b', vctx)
+        )
+        if hits > 0:
+            has_num   = 1 if re.search(r'\d', v.get("Value", "")) else 0
+            unit_bonus = 10 if (wants_nt and '(nt)' in vname) or (wants_bp and '(bp)' in vname) else 0
+            scored.append((hits * 10 + has_num + unit_bonus, v))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    best_v_score = scored[0][0]
+    if best_v_score < 20:   # require ≥ 2 effective matching signals
+        return None
+
+    tied = [v for s, v in scored if s == best_v_score]
+
+    # Proximity tiebreaker: when two variables share the top score, prefer the one
+    # whose numeric value appears closest (within 3 words) to the question's key terms.
+    if len(tied) > 1:
+        prox = [(v, _proximity_score(v, terms, word_window=3)) for v in tied]
+        prox.sort(key=lambda x: -x[1])
+        best_prox = prox[0][1]
+        # Only break the tie if one candidate clearly wins
+        if best_prox > 0 and prox[0][1] > prox[1][1]:
+            tied = [prox[0][0]]
+
+    # Bigram tiebreaker: prefer the variable whose full context contains more
+    # two-word question phrases (e.g. "target recognition" → 20-nt wins over 12-bp).
+    if len(tied) > 1:
+        q_words_all = re.findall(r'\b[a-z]\w+\b', question.lower())
+        q_bigrams = [
+            f"{q_words_all[i]} {q_words_all[i+1]}"
+            for i in range(len(q_words_all) - 1)
+            if q_words_all[i] not in _VAR_LOOKUP_STOP
+            and q_words_all[i+1] not in _VAR_LOOKUP_STOP
+            and len(q_words_all[i]) > 2
+            and len(q_words_all[i+1]) > 2
+        ]
+        if q_bigrams:
+            bigram_scores = [
+                (sum(1 for bg in q_bigrams if bg in v.get("Context", "").lower()), v)
+                for v in tied
+            ]
+            bigram_scores.sort(key=lambda x: -x[0])
+            if bigram_scores[0][0] > 0 and bigram_scores[0][0] > bigram_scores[1][0]:
+                tied = [bigram_scores[0][1]]
+
+    # Absent-qualifier tiebreaker: if a qualifier word (e.g. "conserved") appears in
+    # the short window AFTER one candidate's value but is NOT in the question, that
+    # candidate is penalised — the question is asking about a different quantity.
+    if len(tied) > 1:
+        _QUALIFIER_TERMS = frozenset({
+            'conserved', 'unique', 'novel', 'shared', 'common', 'subset', 'enriched',
+        })
+        absent_quals = _QUALIFIER_TERMS - set(terms)
+        if absent_quals:
+            def _absent_penalty(v: dict) -> int:
+                ctx = re.sub(r'[,~≈<>]', '', v.get("Context", "").lower())
+                vc  = re.sub(r'[,~≈<>]', '', v.get("Value", "").lower())
+                m = re.search(r'\d+', vc)
+                if not m:
+                    return 0
+                m2 = re.search(r'\b' + re.escape(m.group()) + r'\b', ctx)
+                if not m2:
+                    return 0
+                window = ' '.join(ctx[m2.start():].split()[:6])
+                return sum(1 for q in absent_quals if re.search(r'\b' + re.escape(q) + r'\b', window))
+            penalty_scores = [(v, _absent_penalty(v)) for v in tied]
+            penalty_scores.sort(key=lambda x: x[1])
+            if penalty_scores[0][1] < penalty_scores[-1][1]:
+                min_p = penalty_scores[0][1]
+                tied = [v for v, p in penalty_scores if p == min_p]
+
+    # First-occurrence tiebreaker: when variables come from the same sentence,
+    # the value appearing first is the total/subject quantity; later values
+    # introduced with "including" etc. are subsets.
+    if len(tied) > 1:
+        def _ctx_position(v: dict) -> int:
+            ctx = re.sub(r'[,~≈<>]', '', v.get("Context", "").lower())
+            vc  = re.sub(r'[,~≈<>]', '', v.get("Value", "").lower())
+            dm = re.search(r'\d+', vc)
+            if not dm:
+                return 9999
+            dm2 = re.search(r'\b' + re.escape(dm.group()) + r'\b', ctx)
+            return dm2.start() if dm2 else 9999
+        ctx_prefixes = [v.get("Context", "")[:120] for v in tied]
+        if len(set(ctx_prefixes)) == 1:  # all from the same sentence
+            pos_scored = sorted(((v, _ctx_position(v)) for v in tied), key=lambda x: x[1])
+            if pos_scored[0][1] < pos_scored[-1][1]:
+                tied = [pos_scored[0][0]]
+
+    best = tied[0]
+    if len(tied) == 1:
+        vname = best.get("Variable / Parameter", "")
+        vval  = best.get("Value", "")
+        ctx   = _value_centered_excerpt(best)
+        return f'{vval}  ({vname})\nSource: "{ctx}"'
+
+    # Still tied — show each with a *value-centered* excerpt so the reader can see
+    # which quantity appears in which part of the shared sentence.
+    lines = []
+    for v in tied[:4]:
+        lines.append(
+            f'  • {v.get("Value","")}  ({v.get("Variable / Parameter","")})\n'
+            f'    Source: "{_value_centered_excerpt(v)}"'
+        )
+    return (
+        f'{len(tied)} matching values found — context below shows where each appears:\n'
+        + '\n'.join(lines)
+    )
+
+
 def _try_email_answer(question: str, results: dict) -> Optional[str]:
     """Return contact emails directly from structured data when the question asks for one."""
     if not _EMAIL_Q_RE.search(question):
@@ -2930,6 +3370,67 @@ def _try_email_answer(question: str, results: dict) -> Optional[str]:
         ctx  = e.get("Context", "")[:120].strip()
         lines.append(f"{val}  (context: {ctx})")
     return "Email contacts found in the document:\n" + "\n".join(f"  • {l}" for l in lines)
+
+
+def _try_url_answer(question: str, results: dict) -> Optional[str]:
+    """Return URLs from structured data when the question asks for a website or link."""
+    if not _URL_Q_RE.search(question):
+        return None
+    urls = [s for s in results.get("structured", []) if s.get("Type") == "URL"]
+    if not urls:
+        return None
+    # Score each URL by how many meaningful question words appear in its context
+    skip = frozenset({'url', 'website', 'web', 'link', 'http', 'www', 'what', 'where',
+                      'the', 'for', 'is', 'are', 'get', 'find', 'tell', 'give', 'access',
+                      'can', 'does', 'how', 'site', 'address', 'page', 'its', 'their'})
+    q_words = {w for w in re.findall(r'\b[a-z]\w{2,}\b', question.lower()) if w not in skip}
+    scored = []
+    for u in urls:
+        ctx = u.get("Context", "").lower()
+        val = u.get("Value", "").lower()
+        score = sum(1 for w in q_words if w in ctx or w in val)
+        scored.append((score, u))
+    scored.sort(key=lambda x: -x[0])
+    if scored and (scored[0][0] > 0 or len(urls) == 1):
+        e = scored[0][1]
+        return f'URL: {e["Value"]}\n(Source: "{e.get("Context","")}")'
+    return None
+
+
+def _try_problem_answer(question: str, results: dict) -> Optional[str]:
+    """For 'is X a problem/concern/risk?' questions, check the problems table
+    and return an explicit Yes (with severity) or No answer."""
+    if not _IS_PROBLEM_Q_RE.search(question):
+        return None
+    problems = results.get("problems", [])
+    _skip = frozenset({'problem', 'concern', 'issue', 'risk', 'dangerous', 'harmful',
+                       'is', 'are', 'the', 'a', 'an', 'that', 'this', 'for', 'and',
+                       'should', 'would', 'could', 'researchers', 'scientists', 'aware',
+                       'high', 'severity', 'potential', 'possible'})
+    q_words = {w for w in re.findall(r'\b[a-z]\w{2,}\b', question.lower())
+               if w not in _skip}
+    if not q_words:
+        return None
+    scored = []
+    for p in problems:
+        subj = p.get("Subject", "").lower()
+        obj  = p.get("Object",  "").lower()
+        subj_score = sum(1 for w in q_words if re.search(r'\b' + re.escape(w) + r'\b', subj))
+        obj_score  = sum(1 for w in q_words if re.search(r'\b' + re.escape(w) + r'\b', obj))
+        score = subj_score * 3 + obj_score
+        if score >= 3:   # require at least one Subject word match
+            scored.append((score, p))
+    if scored:
+        scored.sort(key=lambda x: -x[0])
+        best_p = scored[0][1]
+        sev  = best_p.get("Severity", "Unknown")
+        src  = best_p.get("Source Sentence", "")[:200]
+        return (f'Yes — flagged as a [{sev}] severity problem in this analysis.\n'
+                f'{best_p.get("Subject", "")} → {best_p.get("Object", "")}\n'
+                f'Source: "{src}"')
+    return ("No — not flagged as a problem in this analysis. "
+            "The subject appears in the document as a factual statement, "
+            "not a risk or concern.")
 
 
 def _try_acronym_answer(question: str, results: dict) -> Optional[str]:
@@ -3000,6 +3501,11 @@ def _try_entity_answer(question: str, results: dict) -> Optional[str]:
     if len(term) < 2:
         return None
     term_lower = term.lower()
+
+    # Exact acronym match takes priority over entity description
+    for _s in results.get("structured", []):
+        if _s.get("Type") == "Acronym" and _s.get("Value", "").lower() == term_lower:
+            return f'{_s["Value"]} stands for: {_s["Detail"]}'
 
     # ── Entity table lookup ────────────────────────────────────────────────
     # Rank matches: exact > starts-with (longer first) > contains (longer first).
@@ -3143,11 +3649,17 @@ def ask_document(question: str, text: str, results: dict) -> str:
         return "Please enter a question."
 
     # ── Structured fast paths (no embedding needed) ────────────────────────
-    for _handler in (_try_count_answer_wrap, _try_email_answer,
-                     _try_acronym_answer, _try_entity_answer,
-                     _try_contradiction_answer):
+    def _summarize_wrap(q: str, t: str) -> Optional[str]:
+        return _try_summarize_answer(q, t, results)
+
+    _TEXT_HANDLERS = frozenset({_try_count_answer_wrap, _try_paragraph_answer,
+                                 _summarize_wrap})
+    for _handler in (_try_count_answer_wrap, _try_paragraph_answer, _summarize_wrap,
+                     _try_variable_answer, _try_email_answer,
+                     _try_url_answer, _try_problem_answer, _try_acronym_answer,
+                     _try_entity_answer, _try_contradiction_answer):
         _ans = (_handler(question, text)
-                if _handler is _try_count_answer_wrap
+                if _handler in _TEXT_HANDLERS
                 else _handler(question, results))
         if _ans:
             return _ans
@@ -3209,13 +3721,44 @@ def ask_document(question: str, text: str, results: dict) -> str:
     if not chunks:
         return "No document content available to search."
 
-    # ── Embed knowledge base + question, rank by cosine similarity ─────────
-    all_texts = [txt for _, txt in chunks]
-    q_emb  = _embed([question])
-    kb_emb = _embed(all_texts)                         # (n_chunks, 384)
-    scores = cosine_similarity(q_emb, kb_emb)[0]      # (n_chunks,)
+    # ── Embed knowledge base + question ────────────────────────────────────
+    all_texts  = [txt for _, txt in chunks]
+    q_emb      = _embed([question])
+    kb_emb     = _embed(all_texts)
+    cos_scores = cosine_similarity(q_emb, kb_emb)[0]   # (n,) semantic scores
 
-    top_idx = sorted(range(len(scores)), key=lambda i: -scores[i])[:14]
+    # ── BM25 lexical scores ─────────────────────────────────────────────────
+    if _BM25_AVAILABLE:
+        _bm25_tok  = [re.findall(r'\b\w+\b', t.lower()) for t in all_texts]
+        _bm25_q    = re.findall(r'\b\w+\b', question.lower())
+        _bm25_raw  = np.array(_BM25Okapi(_bm25_tok).get_scores(_bm25_q), dtype=float)
+        _bm25_max  = _bm25_raw.max()
+        _bm25_norm = _bm25_raw / _bm25_max if _bm25_max > 0 else _bm25_raw
+    else:
+        _bm25_norm = cos_scores   # pure semantic fallback
+
+    # ── RRF fusion: merge semantic + lexical ranks (k=60) ──────────────────
+    _n   = len(all_texts)
+    _rrf = np.zeros(_n)
+    for _pos, _idx in enumerate(np.argsort(-cos_scores)):
+        _rrf[_idx] += 1.0 / (60 + _pos + 1)
+    for _pos, _idx in enumerate(np.argsort(-_bm25_norm)):
+        _rrf[_idx] += 1.0 / (60 + _pos + 1)
+
+    # ── Cross-encoder reranking over top-25 hybrid candidates ──────────────
+    _top_pool = sorted(range(_n), key=lambda i: -_rrf[i])[:25]
+    if CROSS_ENC is not None and len(_top_pool) > 1:
+        _pairs  = [(question, all_texts[i]) for i in _top_pool]
+        _ce_raw = CROSS_ENC.predict(_pairs, show_progress_bar=False)
+        _ce_sig = np.array([1.0 / (1.0 + np.exp(-float(s))) for s in _ce_raw])
+        _reranked = sorted(zip(_top_pool, _ce_sig), key=lambda x: -x[1])
+        top_idx = [i for i, _ in _reranked[:14]]
+        scores  = cos_scores.copy()
+        for _i, _s in zip(_top_pool, _ce_sig):
+            scores[_i] = _s         # replace cosine with CE sigmoid for top candidates
+    else:
+        top_idx = _top_pool[:14]
+        scores  = cos_scores
 
     # ── Deduplicate and group by category ─────────────────────────────────
     seen: set = set()
@@ -3232,11 +3775,39 @@ def ask_document(question: str, text: str, results: dict) -> str:
         return "No relevant content found for this question."
 
     # ── Pick the single best-scoring item as the direct answer ────────────
+    # Short Relationship / Concept / Entity strings (e.g. "Scientists adapt genome")
+    # can score high by coincidence but carry little information.  Require ≥ 8 words
+    # for those categories to qualify as the primary BEST MATCH.
     best_score, best_lbl, best_txt = 0.0, "", ""
+    best_score_fb, best_lbl_fb, best_txt_fb = 0.0, "", ""   # unconditional fallback
     for lbl, items in grouped.items():
         sc, tx = items[0]
+        if sc > best_score_fb:
+            best_score_fb, best_lbl_fb, best_txt_fb = sc, lbl, tx
+        if lbl in ("Relationship", "Concept", "Entity") and len(tx.split()) < 8:
+            continue   # skip short noisy chunks for the primary answer slot
         if sc > best_score:
             best_score, best_lbl, best_txt = sc, lbl, tx
+    if not best_txt:   # every chunk was filtered — fall back to unconditional best
+        best_score, best_lbl, best_txt = best_score_fb, best_lbl_fb, best_txt_fb
+
+    # Enumeration extension: when the best passage is a numbered-list header
+    # (ends with "1." or "stages:" etc.), append the next consecutive Passage
+    # chunks so the full list is shown rather than just the intro line.
+    if (best_lbl == "Passage"
+            and re.search(r'(?::\s*\n?\s*\d+\.?\s*$|three\s+stages|steps:|phases:)',
+                          best_txt, re.I)):
+        _best_idx = next(
+            (i for i in range(len(chunks)) if chunks[i][1] == best_txt), None)
+        if _best_idx is not None:
+            _ext: List[str] = []
+            for _i in range(_best_idx + 1, min(_best_idx + 6, len(chunks))):
+                if chunks[_i][0] == "Passage":
+                    _ext.append(chunks[_i][1].strip())
+                else:
+                    break
+            if _ext:
+                best_txt = best_txt.rstrip() + "\n" + "\n".join(_ext)
 
     parts: List[str] = []
 
