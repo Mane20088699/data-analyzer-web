@@ -1910,12 +1910,47 @@ def build_dependencies(rels: List[Dict]) -> List[Dict]:
     return out[:80]
 
 # ── Causal-chain construction ───────────────────────────────────────────────────
-def build_causal_chains(causal: List[Dict]) -> List[Dict]:
-    G = nx.DiGraph(); conf: Dict[Tuple[str, str], float] = {}
-    for r in causal:
+# Verbs whose SVO relations express a directional cause→effect / enablement link.
+# Used to enrich the sparse causal-typed relations so chains can span 3–4+ nodes.
+_CAUSAL_VERBS = {
+    "enable", "enables", "enabled", "require", "requires", "required",
+    "lead", "leads", "led", "cause", "causes", "caused", "result", "results",
+    "produce", "produces", "produced", "allow", "allows", "allowed",
+    "drive", "drives", "trigger", "triggers", "generate", "generates",
+    "provide", "provides", "pave", "paves", "paved", "expedite", "expedites",
+    "accelerate", "accelerates", "ensure", "ensures", "ensured",
+    "improve", "improves", "reduce", "reduces", "increase", "increases",
+    "enhance", "enhances", "affect", "affects", "impact", "impacts",
+}
+
+
+def build_causal_chains(causal: List[Dict], rels: Optional[List[Dict]] = None) -> List[Dict]:
+    # Trusted causal-typed relations, plus high-confidence SVO relations whose verb
+    # is directional cause→effect — this densifies an otherwise disconnected graph.
+    edges_in: List[Dict] = list(causal)
+    for r in (rels or []):
+        verb = (r.get("Relationship", "") or "").lower().split()
+        if verb and verb[0] in _CAUSAL_VERBS and float(r.get("Confidence", 0) or 0) >= 75:
+            edges_in.append(r)
+
+    # Canonicalise node labels so the object of one edge merges with the synonymous
+    # subject of another ("efficiency of viral vector" ≈ "…packaging") and chains link.
+    raw = []
+    for r in edges_in:
         s = _node_label(r.get("Subject", "")).lower(); o = _node_label(r.get("Object", "")).lower()
-        if not s or not o or s == o: continue
-        G.add_edge(s, o); conf[(s, o)] = max(conf.get((s, o), 0), r.get("Confidence", 65))
+        if not s or not o or s == o:
+            continue
+        raw.append((s, o, float(r.get("Confidence", 65) or 65)))
+    if not raw:
+        return []
+    cmap = _standardize_nodes([s for s, _, _ in raw] + [o for _, o, _ in raw])
+
+    G = nx.DiGraph(); conf: Dict[Tuple[str, str], float] = {}
+    for s, o, c in raw:
+        sk, ok = cmap.get(s, s), cmap.get(o, o)
+        if sk == ok:
+            continue
+        G.add_edge(sk, ok); conf[(sk, ok)] = max(conf.get((sk, ok), 0), c)
     if G.number_of_edges() == 0:
         return []
 
@@ -2448,9 +2483,14 @@ def _infer_relationships(G: nx.DiGraph, emb_of: Dict[str, np.ndarray],
     return added
 
 # ── Knowledge graph (influence / betweenness / key nodes) ───────────────────────
+# Editable: domain terms to always surface as graph nodes when present in the text
+# (hyphens/spacing are normalised at match time, so "off-target" matches "off target").
+_SEED_NODE_TERMS = {"gene drive", "off-target", "xenotransplantation"}
+
+
 def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
                           problems: List[Dict], concepts: List[Dict],
-                          max_nodes: int = 120) -> Dict:
+                          max_nodes: int = 150) -> Dict:
     ent_type, ent_count = {}, {}
     for e in entities:
         k = e["Entity"].lower()
@@ -2494,8 +2534,31 @@ def build_knowledge_graph(rels: List[Dict], entities: List[Dict],
                          sentence=_clean(r.get("Source Sentence", ""), 200),
                          problem=(sk, ok) in problem_pairs, weight=1, inferred=False)
 
+    # Salient nodes we never want pruned even at low degree: problem participants,
+    # named entities, top key-concepts, and editable domain seed terms. Keeps terms
+    # like "gene drives" / "xenotransplantation" from being dropped by the degree cut.
+    _norm = lambda t: (t or "").replace("-", " ").lower()
+    protected: set = set()
+    for a, b in problem_pairs:
+        protected.update((a, b))
+    for e in entities:
+        protected.add(canon(e.get("Entity", "")))
+    for c in concepts[:30]:
+        protected.add(canon(c.get("Concept", "")))
+    for n in list(G.nodes):
+        surf = _norm(G.nodes[n].get("label", "") or n)
+        if any(_norm(term) in surf for term in _SEED_NODE_TERMS):
+            protected.add(n)
+    protected &= set(G.nodes)
+
     if G.number_of_nodes() > max_nodes:
-        keep = [n for n, _ in sorted(G.degree, key=lambda x: -x[1])[:max_nodes]]
+        ranked = [n for n, _ in sorted(G.degree, key=lambda x: -x[1])]
+        keep = list(protected)                     # protected always survive
+        for n in ranked:
+            if len(keep) >= max_nodes:
+                break
+            if n not in protected:
+                keep.append(n)
         G = G.subgraph(keep).copy()
 
     # 2 ── relationship inference (transitive + similarity bridging) to densify
@@ -2822,7 +2885,7 @@ def analyze():
     problems        = _dedup_problems(problems)
     problems, structured = ai_postprocess(problems, structured, combined)
     dependencies    = build_dependencies(all_rels)
-    causal_chains   = build_causal_chains(causal)
+    causal_chains   = build_causal_chains(causal, all_rels)
     contradictions  = detect_contradictions(all_rels, variables, sents)
     assumptions     = detect_assumptions(sents)
     rels_display    = [_display_rel(r) for r in all_rels]

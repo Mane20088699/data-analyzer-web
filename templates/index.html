@@ -38,6 +38,36 @@
     .tab-btn { color: #6b7280; }
     .tab-btn:hover:not(.active) { background: #f3f4f6; color: #374151; }
 
+    /* ── Split-panel tab styles ─────────────────────────────────────────── */
+    .ptab-btn { color: #6b7280; }
+    .ptab-btn.active {
+      background: white; color: #1e3a8a; font-weight: 700;
+      border-bottom: 2px solid #2563eb;
+    }
+    .ptab-btn:hover:not(.active) { background: #f3f4f6; color: #374151; }
+
+    /* ── Split-panel divider ────────────────────────────────────────────── */
+    .split-gutter {
+      position: relative; width: 8px; flex-shrink: 0;
+      background: #e5e7eb; cursor: col-resize;
+    }
+    .split-gutter:hover { background: #d1d5db; }
+    .split-handle {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 20px;
+      background: #f9fafb; border: 1px solid #cbd5e1; border-radius: 5px;
+      display: flex; flex-direction: column; overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.15); z-index: 2;
+    }
+    .split-arrow {
+      width: 100%; height: 22px; background: transparent; border: none;
+      color: #2563eb; font-size: 10px; line-height: 1; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .split-arrow:hover { background: #eff6ff; }
+    .split-arrow + .split-arrow { border-top: 1px solid #e5e7eb; }
+
     /* ── Table ──────────────────────────────────────────────────────────── */
     table { border-collapse: collapse; width: 100%; font-size: 13px; }
     th { background: #1e3a8a; color: white; padding: 8px 12px;
@@ -153,36 +183,70 @@
     <div class="glass-white rounded-xl shadow-xl overflow-hidden">
       <div class="flex border-b border-gray-200 overflow-x-auto" id="tab-bar">
         <button class="tab-btn active px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('files',this)">Files</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('entities',this)">Entities</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('typed_entities',this)">Typed Entities</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('structured',this)">Structured Data</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('concepts',this)">Key Concepts</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('variables',this)">Variables</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('relationships',this)">Relationships</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
                 onclick="showTab('problems',this)">Problems</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
                 onclick="showTab('dependencies',this)">Dependencies</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('causal_chains',this)">Causal Chains</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
                 onclick="showTab('contradictions',this)">Contradictions</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
                 onclick="showTab('assumptions',this)">Assumptions</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('insights',this)">Insights</button>
-        <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('graph',this)">Knowledge Graph</button>
       </div>
       <div class="overflow-auto max-h-[420px]" id="table-area">
         <p class="text-gray-400 text-center py-12 text-sm">Run analysis to see results.</p>
+      </div>
+    </div>
+
+    <!-- Resizable split view: Analysis (panel 1) | Extracted (panel 2) -->
+    <div class="glass-white rounded-xl shadow-xl overflow-hidden mt-6">
+      <div class="flex" id="split-container" style="height:520px;">
+
+        <!-- Panel 1: Analysis (Group 1) -->
+        <div class="flex flex-col min-w-0" id="panel1" style="flex-basis:50%;">
+          <div class="flex items-center border-b border-gray-200 overflow-x-auto bg-gray-50">
+            <span class="pl-4 pr-2 text-[11px] font-semibold uppercase tracking-wide text-gray-400 shrink-0">Analysis</span>
+            <button class="ptab-btn active px-3 py-2.5 text-xs transition whitespace-nowrap"
+                    onclick="showPTab(1,'concepts',this)">Key Concepts</button>
+            <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
+                    onclick="showPTab(1,'relationships',this)">Relationships</button>
+            <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
+                    onclick="showPTab(1,'causal_chains',this)">Causal Chains</button>
+            <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
+                    onclick="showPTab(1,'insights',this)">Insights</button>
+            <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
+                    onclick="showPTab(1,'graph',this)">Knowledge Graph</button>
+          </div>
+          <div class="flex-1 overflow-auto" id="panel1-area">
+            <p class="text-gray-400 text-center py-12 text-sm">Run analysis to see results.</p>
+          </div>
+        </div>
+
+        <!-- Draggable divider with two-way collapse -->
+        <div id="splitter" class="split-gutter">
+          <div class="split-handle" onmousedown="event.stopPropagation()">
+            <button id="collapse-left" class="split-arrow"
+                    onclick="collapsePanel('left')" title="Collapse left panel">◀</button>
+            <button id="collapse-right" class="split-arrow"
+                    onclick="collapsePanel('right')" title="Collapse right panel">▶</button>
+          </div>
+        </div>
+
+        <!-- Panel 2: Extracted (Group 2) -->
+        <div class="flex flex-col min-w-0" id="panel2" style="flex-basis:50%;">
+          <div class="flex items-center border-b border-gray-200 overflow-x-auto bg-gray-50">
+            <span class="pl-4 pr-2 text-[11px] font-semibold uppercase tracking-wide text-gray-400 shrink-0">Extracted</span>
+            <button class="ptab-btn active px-3 py-2.5 text-xs transition whitespace-nowrap"
+                    onclick="showPTab(2,'entities',this)">Entities</button>
+            <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
+                    onclick="showPTab(2,'typed_entities',this)">Typed Entities</button>
+            <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
+                    onclick="showPTab(2,'structured',this)">Structured Data</button>
+            <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
+                    onclick="showPTab(2,'variables',this)">Variables</button>
+          </div>
+          <div class="flex-1 overflow-auto" id="panel2-area">
+            <p class="text-gray-400 text-center py-12 text-sm">Run analysis to see results.</p>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -404,7 +468,9 @@ void main(){
 let files   = [];
 let sid     = null;
 let results = null;
-let activeTab = 'files';
+let activeTab = 'problems';
+let activeP1  = 'concepts';   // left split panel (Analysis)
+let activeP2  = 'entities';   // right split panel (Extracted)
 
 /* ── File handling ──────────────────────────────────────────────────────── */
 function addFiles(fileList) {
@@ -479,7 +545,9 @@ function showProgress(visible, msg = '', pct = 0) {
 /* ── Render results ─────────────────────────────────────────────────────── */
 function renderResults() {
   renderSummaryCards(results.summary);
-  showTab(activeTab, document.querySelector('.tab-btn.active'));
+  showTab(activeTab, document.querySelector('#tab-bar .tab-btn.active'));
+  showPTab(1, activeP1, document.querySelector('#panel1 .ptab-btn.active'));
+  showPTab(2, activeP2, document.querySelector('#panel2 .ptab-btn.active'));
 }
 function renderSummaryCards(summary) {
   const c = document.getElementById('summary-cards');
@@ -495,10 +563,78 @@ function renderSummaryCards(summary) {
 }
 function showTab(name, btnEl) {
   activeTab = name;
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('#tab-bar .tab-btn').forEach(b => b.classList.remove('active'));
   if (btnEl) btnEl.classList.add('active');
+  renderInto('table-area', name);
+}
+
+function showPTab(panel, name, btnEl) {
+  if (panel === 1) activeP1 = name; else activeP2 = name;
+  document.querySelectorAll('#panel' + panel + ' .ptab-btn')
+          .forEach(b => b.classList.remove('active'));
+  if (btnEl) btnEl.classList.add('active');
+  renderInto('panel' + panel + '-area', name);
+}
+
+/* ── Split-pane resize + collapse ─────────────────────────────────────── */
+function initSplitter() {
+  const splitter  = document.getElementById('splitter');
+  const container = document.getElementById('split-container');
+  const p1        = document.getElementById('panel1');
+  if (!splitter || !container || !p1) return;
+  let dragging = false;
+  splitter.addEventListener('mousedown', e => {
+    dragging = true; document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none'; e.preventDefault();
+  });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const rect = container.getBoundingClientRect();
+    let pct = ((e.clientX - rect.left) / rect.width) * 100;
+    pct = Math.max(15, Math.min(85, pct));
+    p1.style.flexBasis = pct + '%';
+  });
+  window.addEventListener('mouseup', () => {
+    dragging = false; document.body.style.cursor = ''; document.body.style.userSelect = '';
+  });
+  // Double-click the gutter resets to an even 50/50 split.
+  splitter.addEventListener('dblclick', resetSplit);
+}
+// splitState: 'even' | 'left' (left collapsed) | 'right' (right collapsed)
+let splitState = 'even';
+function resetSplit() {
+  const p1 = document.getElementById('panel1');
+  const p2 = document.getElementById('panel2');
+  p1.style.flexBasis = '50%'; p1.style.overflow = '';
+  p2.style.flexBasis = '50%'; p2.style.overflow = '';
+  splitState = 'even'; updateHandleArrows();
+}
+function collapsePanel(side) {
+  const p1 = document.getElementById('panel1');
+  const p2 = document.getElementById('panel2');
+  if (splitState === side) { resetSplit(); return; }   // toggle back to even
+  splitState = side;
+  if (side === 'left') {
+    p1.style.flexBasis = '0%';   p1.style.overflow = 'hidden';
+    p2.style.flexBasis = '100%'; p2.style.overflow = '';
+  } else {
+    p2.style.flexBasis = '0%';   p2.style.overflow = 'hidden';
+    p1.style.flexBasis = '100%'; p1.style.overflow = '';
+  }
+  updateHandleArrows();
+}
+function updateHandleArrows() {
+  const lb = document.getElementById('collapse-left');
+  const rb = document.getElementById('collapse-right');
+  // When a side is collapsed its arrow flips to point the panel back out.
+  lb.textContent = splitState === 'left'  ? '▶' : '◀';
+  rb.textContent = splitState === 'right' ? '◀' : '▶';
+}
+initSplitter();
+
+function renderInto(areaId, name) {
   if (!results) return;
-  const area = document.getElementById('table-area');
+  const area = document.getElementById(areaId);
   if (name === 'graph') {
     area.style.maxHeight = 'none';
     renderGraph(area);
