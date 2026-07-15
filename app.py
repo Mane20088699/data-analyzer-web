@@ -242,10 +242,39 @@ ANTONYM_PAIRS = [
 # Assumption markers → confidence that the sentence states a (possibly hidden) premise.
 ASSUMPTION_MARKERS = {
     "it is assumed": 85, "we assume": 85, "taken for granted": 82, "assumption": 80,
-    "assuming": 80, "presume": 78, "assume": 78, "presumably": 70, "supposedly": 68,
-    "by default": 65, "given that": 60, "we believe": 60, "suppose": 60,
-    "in theory": 58, "expected to": 55, "should be": 50,
+    "assuming": 80, "presume": 78, "presumes": 78, "assume": 78, "presumably": 70,
+    "supposedly": 68, "by default": 65, "given that": 60, "we believe": 60,
+    "suppose": 60, "in theory": 58, "expected to": 55, "should be": 50,
+    # conditional / expectation premises (frequently unstated assumptions)
+    "provided that": 62, "as long as": 60, "so long as": 60, "in principle": 60,
+    "it is conceivable": 58, "conceivable that": 58, "would need to": 55,
+    "will need to": 55,
 }
+
+# Benefit↔cost trade-off axes: (label, positive-property regex, opposing-cost regex).
+# A document that asserts an upside on one axis while acknowledging its downside is
+# expressing a real tension the plain contradiction rules (same subject/object) miss.
+_TRADEOFF_AXES = [
+    ("precision vs off-target",
+     re.compile(r'\b(?:precise|precision|accura\w*|specificit\w*|high[- ]fidelity|on[- ]target)\b', re.I),
+     re.compile(r'\b(?:off[- ]target|non[- ]specific|nonspecific|imprecis\w*|mismatch\w*|unintended)\b', re.I)),
+    ("speed/efficiency vs safety",
+     re.compile(r'\b(?:rapid\w*|fast(?:er)?|quick\w*|speed|efficien\w*|accelerat\w*|high[- ]throughput|scal\w*)\b', re.I),
+     re.compile(r'\b(?:safety|safe|toxic\w*|risk\w*|adverse|caution\w*|side[- ]effect\w*|hazard\w*)\b', re.I)),
+    ("benefit vs limitation",
+     re.compile(r'\b(?:advantage\w*|benefit\w*|promising|promise|powerful|potential|opportunit\w*)\b', re.I),
+     re.compile(r'\b(?:limitation\w*|challenge\w*|drawback\w*|hurdle\w*|obstacle\w*|barrier\w*|ethical concern\w*)\b', re.I)),
+]
+
+# Thematic-assumption cues: a modal/expectation term AND a key theme in one sentence
+# flags an implicit premise about that theme (e.g. delivery scaling, specificity).
+_ASSUMPTION_EXPECT_RE = re.compile(
+    r'\b(?:will|would|could|should|can|expect\w*|likely|assum\w*|presum\w*|'
+    r'in principle|provided|as long as|need(?:s)? to|enough|sufficient\w*)\b', re.I)
+_ASSUMPTION_THEME_RE = re.compile(
+    r'\b(?:deliver\w*|specificit\w*|off[- ]target|scal\w*|efficien\w*|safet\w*|'
+    r'accura\w*|target(?:ing|ed)?\s+cell\w*|clinical\s+(?:use|trial\w*|application\w*)|'
+    r'dosage|dosing)\b', re.I)
 
 _NEGATIONS = {
     "not","no","never","cannot","can't","won't","doesn't","don't","isn't",
@@ -2085,7 +2114,34 @@ def detect_contradictions(rels: List[Dict], variables: List[Dict],
                     "Statement B": _clean(sent, 180),
                     "Conflict Type": "contrastive claim",
                     "Severity": "Medium"})
+
+    # 4 ── benefit↔cost trade-offs (precision vs off-target, speed vs safety, …)
+    out.extend(_detect_tradeoffs(sents))
     return out[:60]
+
+
+def _detect_tradeoffs(sents: List[str]) -> List[Dict]:
+    """Surface benefit↔cost tensions: an upside claim on an axis alongside its
+    acknowledged downside. High severity when a single sentence states both
+    (author-acknowledged); Medium when the two sides come from different sentences."""
+    out: List[Dict] = []
+    def _ok(s: str) -> bool:
+        return 40 <= len(s) <= 260
+    for name, pos, neg in _TRADEOFF_AXES:
+        both     = [s for s in sents if _ok(s) and pos.search(s) and neg.search(s)]
+        pos_only = [s for s in sents if _ok(s) and pos.search(s) and not neg.search(s)]
+        neg_only = [s for s in sents if _ok(s) and neg.search(s) and not pos.search(s)]
+        if both:
+            a = pos_only[0] if pos_only else both[0]
+            b = both[0] if both[0] != a else (neg_only[0] if neg_only else both[0])
+            sev = "High"
+        elif pos_only and neg_only:
+            a, b, sev = pos_only[0], neg_only[0], "Medium"
+        else:
+            continue
+        out.append({"Statement A": _clean(a, 180), "Statement B": _clean(b, 180),
+                    "Conflict Type": f"trade-off ({name})", "Severity": sev})
+    return out
 
 # ── Assumption discovery ────────────────────────────────────────────────────────
 def detect_assumptions(sents: List[str]) -> List[Dict]:
@@ -2105,6 +2161,25 @@ def detect_assumptions(sents: List[str]) -> List[Dict]:
                                                 if explicit else
                                                 "Some downstream reasoning may be weakened.")})
                 break
+
+    # Thematic (often hidden) premises: a modal/expectation cue co-occurring with a
+    # key theme (delivery, specificity, scalability, safety…). Gating on the theme
+    # keeps precision high while surfacing assumptions like "delivery methods will
+    # scale to human use" or "specificity is sufficient for clinical application".
+    for s in sents:
+        if not (40 <= len(s) <= 260):
+            continue
+        if not (_ASSUMPTION_EXPECT_RE.search(s) and _ASSUMPTION_THEME_RE.search(s)):
+            continue
+        key = s.lower()[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        theme = _ASSUMPTION_THEME_RE.search(s).group(0).lower()
+        out.append({"Assumption": _clean(s, 220), "Type": "Implicit",
+                    "Marker": f"expectation about {theme}", "Confidence": 55,
+                    "Impact if False": f"An unverified premise about {theme} may not hold; "
+                                       "dependent conclusions weaken."})
     out.sort(key=lambda a: -a["Confidence"])
     return out[:60]
 
@@ -2649,6 +2724,31 @@ def build_executive_insights(entities, concepts, variables, problems, rels,
     if strong_assum:
         add("Risk — Assumption",
             f'{len(strong_assum)} strong assumptions underpin the reasoning')
+
+    # Competing / conflicting financial-interest disclosures are a governance red
+    # flag in academic & business audits. Surface them as an explicit risk alert
+    # instead of leaving the sentence buried in the relationships table. Negated
+    # disclosures ("declare no competing interests") are a clean note, not a risk.
+    _COI_RE = re.compile(
+        r'\b(?:competing\s+(?:financial\s+)?interests?|conflicts?\s+of\s+interest|'
+        r'financial\s+(?:conflict|interest|disclosure)s?)\b', re.I)
+    _COI_NEG_RE = re.compile(
+        r'\bno\s+(?:competing|conflict|financial)|declares?\s+no|without\s+(?:any\s+)?'
+        r'(?:competing|conflict)|not\s+to\s+(?:have|declare)\b', re.I)
+    coi_src = ""
+    for r in rels:
+        blob = " ".join([r.get("Subject", ""), r.get("Relationship", ""),
+                         r.get("Object", ""), r.get("Source Sentence", "")])
+        if _COI_RE.search(blob):
+            coi_src = r.get("Source Sentence", "") or blob
+            break
+    if coi_src and not _COI_NEG_RE.search(coi_src):
+        add("Risk — Competing Interests",
+            f'Financial conflict-of-interest disclosed — verify independence: '
+            f'"{_clean(coi_src, 200)}"')
+    elif coi_src:
+        add("Governance — Competing Interests",
+            f'No competing interests declared: "{_clean(coi_src, 200)}"')
 
     if causal_chains:
         rc = Counter(c["Root Cause"] for c in causal_chains).most_common(1)[0][0]

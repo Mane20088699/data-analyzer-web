@@ -72,6 +72,10 @@
     table { border-collapse: collapse; width: 100%; font-size: 13px; }
     th { background: #1e3a8a; color: white; padding: 8px 12px;
          text-align: left; font-weight: 600; white-space: nowrap; }
+    /* Headers with a hover explanation: dotted underline + help cursor as a cue. */
+    th.th-help { cursor: help; text-decoration: underline dotted rgba(255,255,255,0.6);
+                 text-underline-offset: 3px; }
+    th.th-help::after { content: " ⓘ"; opacity: 0.7; font-size: 11px; }
     td { padding: 6px 12px; border-bottom: 1px solid #e5e7eb; color: #111827;
          max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     tr:nth-child(even) td { background: #f9fafb; }
@@ -183,13 +187,17 @@
     <div class="glass-white rounded-xl shadow-xl overflow-hidden">
       <div class="flex border-b border-gray-200 overflow-x-auto" id="tab-bar">
         <button class="tab-btn active px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('problems',this)">Problems</button>
+                onclick="showTab('problems',this)"
+                title="Risks, limitations and concerns found in the text, ranked Critical→Low. Start here to see what could go wrong or needs attention. Red rows = highest severity.">Problems</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('dependencies',this)">Dependencies</button>
+                onclick="showTab('dependencies',this)"
+                title="What relies on what. Use it to spot prerequisites and circular dependencies (flagged 'Yes' in the Circular column), which signal fragile or tangled reasoning.">Dependencies</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('contradictions',this)">Contradictions</button>
+                onclick="showTab('contradictions',this)"
+                title="Conflicting statements and trade-offs (e.g. precision vs off-target, speed vs safety). Review these to reconcile tensions before drawing conclusions.">Contradictions</button>
         <button class="tab-btn px-5 py-3 text-sm transition whitespace-nowrap"
-                onclick="showTab('assumptions',this)">Assumptions</button>
+                onclick="showTab('assumptions',this)"
+                title="Unstated or hedged premises the reasoning depends on (including delivery/specificity-type assumptions). Check these to judge how solid the conclusions are if a premise fails.">Assumptions</button>
       </div>
       <div class="overflow-auto max-h-[420px]" id="table-area">
         <p class="text-gray-400 text-center py-12 text-sm">Run analysis to see results.</p>
@@ -205,13 +213,17 @@
           <div class="flex items-center border-b border-gray-200 overflow-x-auto bg-gray-50">
             <span class="pl-4 pr-2 text-[11px] font-semibold uppercase tracking-wide text-gray-400 shrink-0">Analysis</span>
             <button class="ptab-btn active px-3 py-2.5 text-xs transition whitespace-nowrap"
-                    onclick="showPTab(1,'concepts',this)">Key Concepts</button>
+                    onclick="showPTab(1,'concepts',this)"
+                    title="The document's most important ideas, ranked by importance with theme clusters. A quick map of what it's really about — scan this to orient yourself fast.">Key Concepts</button>
             <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
-                    onclick="showPTab(1,'relationships',this)">Relationships</button>
+                    onclick="showPTab(1,'relationships',this)"
+                    title="Subject → action → object links pulled from the text. Trace how things act on each other; use the Confidence column to weight how reliable each link is.">Relationships</button>
             <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
-                    onclick="showPTab(1,'causal_chains',this)">Causal Chains</button>
+                    onclick="showPTab(1,'causal_chains',this)"
+                    title="Cause → effect sequences. Follow a chain from its Root Cause to the Final Outcome to understand what drives what; longer chains reveal deeper knock-on effects.">Causal Chains</button>
             <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
-                    onclick="showPTab(1,'insights',this)">Insights</button>
+                    onclick="showPTab(1,'insights',this)"
+                    title="Auto-generated executive summary — the top entity, biggest risks (including competing-interest flags), root causes and recommendations. Read this first for the big picture.">Insights</button>
             <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
                     onclick="showPTab(1,'graph',this)">Knowledge Graph</button>
           </div>
@@ -235,13 +247,17 @@
           <div class="flex items-center border-b border-gray-200 overflow-x-auto bg-gray-50">
             <span class="pl-4 pr-2 text-[11px] font-semibold uppercase tracking-wide text-gray-400 shrink-0">Extracted</span>
             <button class="ptab-btn active px-3 py-2.5 text-xs transition whitespace-nowrap"
-                    onclick="showPTab(2,'entities',this)">Entities</button>
+                    onclick="showPTab(2,'entities',this)"
+                    title="Named things — people, organisations, systems, places, diseases — ranked by importance/tier with mention counts. Use it to see the key players and how central each is.">Entities</button>
             <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
-                    onclick="showPTab(2,'typed_entities',this)">Typed Entities</button>
+                    onclick="showPTab(2,'typed_entities',this)"
+                    title="Domain-specific entities (products, events, job titles) detected by the GLiNER model with a Confidence score. Use for finer categorisation; higher confidence = more reliable.">Typed Entities</button>
             <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
-                    onclick="showPTab(2,'structured',this)">Structured Data</button>
+                    onclick="showPTab(2,'structured',this)"
+                    title="Emails, URLs, acronyms, citations and percentages pulled out verbatim. Use it to grab contacts, term definitions and key figures without hunting through the text.">Structured Data</button>
             <button class="ptab-btn px-3 py-2.5 text-xs transition whitespace-nowrap"
-                    onclick="showPTab(2,'variables',this)">Variables</button>
+                    onclick="showPTab(2,'variables',this)"
+                    title="Numeric parameters and measured quantities with their values and source context. Use it to audit the document's quantitative claims (counts, lengths, percentages, doses).">Variables</button>
           </div>
           <div class="flex-1 overflow-auto" id="panel2-area">
             <p class="text-gray-400 text-center py-12 text-sm">Run analysis to see results.</p>
@@ -632,6 +648,38 @@ function updateHandleArrows() {
 }
 initSplitter();
 
+/* Explicit column order per tab (falls back to natural key order for any tab
+   not listed here, and appends any unlisted-but-present columns at the end so
+   nothing is ever silently dropped). */
+const COLUMN_ORDER = {
+  problems:       ['Problem Type', 'Object', 'Affected Entities', 'Subject', 'Relationship', 'Severity', 'Root Causes', 'Source Sentence'],
+  entities:       ['Entity', 'Description', 'Context', 'Type', 'Tier', 'Importance', 'Occurrences'],
+  typed_entities: ['Entity', 'Confidence', 'Context', 'Label'],
+  variables:      ['Type', 'Value', 'Context', 'Variable / Parameter'],
+};
+function orderedColumns(name, data) {
+  const present = new Set();
+  data.forEach(row => Object.keys(row).forEach(k => present.add(k)));
+  const preferred = COLUMN_ORDER[name];
+  if (!preferred) return Array.from(present);
+  const ordered = preferred.filter(c => present.has(c));
+  const extra   = Array.from(present).filter(c => !ordered.includes(c));
+  return ordered.concat(extra);
+}
+
+/* Hover explanations for cryptic column headers (keyed by exact header text). */
+const COLUMN_TOOLTIPS = {
+  'Circular?': "Yes = this item sits in a dependency loop — A depends on B and B depends (directly or indirectly) back on A. Such loops can't be resolved in a clean order and usually signal a design or reasoning flaw worth untangling.",
+  'Total (incl. indirect)': "How many items this depends on in total, counting knock-on (indirect) dependencies, not just its direct ones.",
+  'Strength': "How strongly this item depends on others — higher means more/heavier dependencies, so it's more affected if they change.",
+  'Confidence': "How reliable this extracted item is (0–100 / 0–1). Higher = the model is more certain it's correct.",
+  'Hallucination Risk': "Flags a relationship the model may have over-inferred (e.g. 'negated' = the source sentence actually negates it). Verify these against the source.",
+  'Rel. Type': "How the link was found — 'syntactic (SVO)' = parsed subject-verb-object; 'causal' = matched a cause/effect pattern.",
+  'Tier': "Prominence band: Primary = most central entities, then Secondary, then Supporting.",
+  'Importance': "A ranking score combining how often and how centrally the item appears — higher = more significant.",
+  'Avg Confidence': "Average reliability of the individual cause→effect links that make up this chain.",
+};
+
 function renderInto(areaId, name) {
   if (!results) return;
   const area = document.getElementById(areaId);
@@ -646,9 +694,14 @@ function renderInto(areaId, name) {
     area.innerHTML = '<p class="text-gray-400 text-center py-12 text-sm">No data found.</p>';
     return;
   }
-  const cols = Object.keys(data[0]);
+  const cols = orderedColumns(name, data);
   let html = '<table><thead><tr>';
-  cols.forEach(c => { html += `<th>${esc(c)}</th>`; });
+  cols.forEach(c => {
+    const tip = COLUMN_TOOLTIPS[c];
+    html += tip
+      ? `<th title="${esc(tip)}" class="th-help">${esc(c)}</th>`
+      : `<th>${esc(c)}</th>`;
+  });
   html += '</tr></thead><tbody>';
   data.forEach(row => {
     const sev = (row.Severity || '').toLowerCase();
